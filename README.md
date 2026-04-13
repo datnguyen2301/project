@@ -174,7 +174,7 @@ ANALYZER_PORT=5100
 PYTHON_PATH=python
 
 # IP Webcam (optional)
-IP_WEBCAM_URL=http://192.168.1.100:8080
+IP_WEBCAM_URL=http://192.168.1.xxx:xxxx
 
 # EZVIZ (optional)
 EZVIZ_EMAIL=your@email.com
