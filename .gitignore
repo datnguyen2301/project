@@ -4,6 +4,10 @@ frontend/dist/
 backend/.env
 package-lock.json
 
+# Agent files
+.cursor/
+AGENTS.md
+
 # Debug logs
 .cursor/debug-*.log
 
