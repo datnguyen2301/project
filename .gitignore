@@ -22,3 +22,7 @@ backend/streams/
 # IDE
 .idea/
 .vscode/
+
+# Test images
+backend/models/_warmup_tmp.jpg
+backend/models/test_car.jpg

@@ -7,15 +7,14 @@ const { spawn } = require('child_process');
 const sharp = require('sharp');
 const Camera = require('../models/Camera');
 const Event = require('../models/Event');
-const { analyzeImage, analyzeImageImmediate, analyzeEventMedia } = require('./analyzer');
+const { analyzeImage, analyzeEventMedia } = require('./analyzer');
 const { captureRtspJpegToFile, captureFromHlsSegment } = require('./rtspCapture');
 const ezviz = require('./ezviz');
 const { isIpWebcamAddress, isEzvizSerialAddress } = require('../utils/cameraAddress');
-const { getBuffer, removeBuffer, STOP_SIGNAL: RB_STOP } = require('./ringBuffer');
+const { getBuffer, STOP_SIGNAL } = require('./ringBuffer');
 const {
   startStreamBridge,
   stopStreamBridge,
-  getBufferForCamera,
 } = require('./streamBridge');
 
 const FETCH_IMAGE_UA =
@@ -25,16 +24,8 @@ const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
 const CLIPS_DIR = path.join(UPLOADS_DIR, 'clips');
 
 // ── Timing constants ─────────────────────────────────────────────────────────
-const CAPTURE_INTERVAL_MS = 150;
-const ANALYZE_INTERVAL_MS = 400;
 const COOLDOWN_MS = 3000;
 const DETECT_INTERVAL_MS = 1500;
-const FETCH_TIMEOUT_MS = 2000;
-const BUSY_TIMEOUT_MS = 15000;
-const CYCLE_TIMEOUT_MS = 60000;
-const BRIDGE_STALL_MS = 6000;
-const ANALYZE_BACKOFF_MAX_MS = 3000;
-const ANALYZE_BACKOFF_INIT_MS = 400;
 
 // ── Recording constants (optimized) ────────────────────────────────────────
 const CLIP_BEFORE_SEC = 10;
@@ -47,8 +38,6 @@ const MIN_CLIP_FRAMES = 3;
 const watchers = new Map();
 const cleanupInProgress = new Set();
 const CACHE_DIR = path.join(UPLOADS_DIR, '.watcher_cache');
-
-const STOP_SIGNAL = {};
 
 async function ensureCacheDir() {
   try { await fsp.mkdir(CACHE_DIR, { recursive: true }); } catch (_) { }
@@ -475,16 +464,25 @@ async function captureOneFrame(camera, opts = {}) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
     try {
-      const response = await fetch(url, { signal: controller.signal });
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'User-Agent': FETCH_IMAGE_UA },
+      });
       if (response.ok) {
         frameBuf = Buffer.from(await response.arrayBuffer());
-        ok = frameBuf.length > 100;
+        if (bufferLooksLikeImage(frameBuf)) {
+          await fsp.writeFile(tmpPath, frameBuf);
+          ok = true;
+          console.log(`[watcher] [${cameraId}] IP Webcam capture OK (${frameBuf.length} bytes)`);
+        } else {
+          console.warn(`[watcher] [${cameraId}] IP Webcam response not an image (${frameBuf.length} bytes)`);
+        }
       } else {
-        console.warn(`[watcher] [${cameraId}] HTTP ${response.status} from ${url}`);
+        console.warn(`[watcher] [${cameraId}] IP Webcam HTTP ${response.status} from ${url}`);
       }
     } catch (err) {
       const code = err.cause?.code || err.cause?.message || '';
-      console.warn(`[watcher] [${cameraId}] HTTP capture error: ${err.message} (${err.name}, cause: ${code})`);
+      console.warn(`[watcher] [${cameraId}] IP Webcam HTTP capture error: ${err.message} (${err.name}, cause: ${code})`);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -1054,30 +1052,33 @@ function scheduleEzvizCycle(cameraId, state, delayMs) {
   }, delayMs);
 }
 
-// ── Capture loop — only for IP Webcam (direct HTTP) ───────────────────────
+// ── Unified watch cycle — single loop for capture + analyze + record ────────
 
-async function captureLoop(cameraId) {
+async function unifiedWatchCycle(cameraId) {
   const state = watchers.get(cameraId);
   if (!state || state.stopped === STOP_SIGNAL) return;
 
   const camera = state.camera;
-  if (!camera) {
-    console.warn(`[watcher] [${cameraId}] No camera in state — stopping capture loop`);
-    return;
-  }
+  if (!camera) return;
+
+  const cycleNum = (state._cycleNum = (state._cycleNum || 0) + 1);
 
   try {
-    const frameBuf = await captureOneFrame(camera);
+    const captureStart = Date.now();
+    const frameBuf = await captureOneFrame(camera, {
+      useCacheOnFail: true,
+      fastMode: false,
+    });
+    const captureMs = Date.now() - captureStart;
+
     if (!frameBuf) {
-      state._captureFailCount = (state._captureFailCount || 0) + 1;
-      const backoff = Math.min(2000, 500 * state._captureFailCount);
-      if (state.stopped !== STOP_SIGNAL) {
-        state.captureTimer = setTimeout(() => captureLoop(cameraId), backoff);
+      if (cycleNum <= 3 || cycleNum % 20 === 1) {
+        console.log(`[watcher] [${cameraId}] Cycle #${cycleNum} — no frame captured (${captureMs}ms)`);
       }
+      scheduleUnifiedCycle(cameraId, state, COOLDOWN_MS);
       return;
     }
 
-    state._captureFailCount = 0;
     const entry = { buffer: frameBuf, ts: performance.now() };
     state.ringBuffer.push(entry);
     state.lastFrameAt = Date.now();
@@ -1088,154 +1089,41 @@ async function captureLoop(cameraId) {
         state.pendingFrames = state.pendingFrames.slice(-MAX_PENDING_FRAMES);
       }
     }
-  } catch (err) {
-    console.warn(`[watcher] [${cameraId}] Capture loop error: ${err.message}`);
-  }
 
-  if (state.stopped !== STOP_SIGNAL) {
-    state.captureTimer = setTimeout(() => captureLoop(cameraId), 500);
-  }
-}
-
-// ── Analyze loop — reads from ring buffer ──────────────────────────────────
-
-async function analyzeLoop(cameraId) {
-  const state = watchers.get(cameraId);
-  if (!state || state.stopped === STOP_SIGNAL) return;
-
-  const camera = state.camera;
-  if (!camera) return;
-
-  const now = performance.now();
-
-  if (state.cycleStartTime && now - state.cycleStartTime > CYCLE_TIMEOUT_MS) {
-    console.warn(`[watcher] [${cameraId}] Cycle timeout, resetting state...`);
-    state.busy = false;
-    state.cycleStartTime = now;
-  }
-
-  if (state.busy) {
-    if (now - state.busyStartTime < BUSY_TIMEOUT_MS) {
-      if (state.stopped !== STOP_SIGNAL) {
-        state.analyzeTimer = setTimeout(() => analyzeLoop(cameraId), state.analyzeInterval);
-      }
-      return;
-    }
-    console.warn(`[watcher] [${cameraId}] Busy timeout, resetting...`);
-    state.busy = false;
-    state.analyzeBackoff = Math.min(state.analyzeBackoff * 1.5, ANALYZE_BACKOFF_MAX_MS);
-    state.analyzeInterval = Math.max(ANALYZE_BACKOFF_INIT_MS, state.analyzeInterval + 200);
-  }
-
-  state.busy = true;
-  state.busyStartTime = now;
-  state.cycleStartTime = now;
-
-  if (state.useStreamBridge) {
-    const bridgeIdleMs = Date.now() - state.lastBridgeCheck;
-    if (bridgeIdleMs > BRIDGE_STALL_MS && !state.isRecording) {
-      console.warn(`[watcher] [${cameraId}] Stream bridge stalled (${bridgeIdleMs}ms) — restarting bridge...`);
-      stopStreamBridge(cameraId);
-      await new Promise((r) => setTimeout(r, 500));
-      startStreamBridge(cameraId, camera);
-      state.lastBridgeCheck = Date.now();
-    }
-  }
-
-  try {
-    const ringBuf = state.ringBuffer;
-    const frameCount = ringBuf.getFrameCount();
-    const newestTs = ringBuf.getNewestTs();
-    const nowTs = performance.now();
-    const bufAge = newestTs ? Math.round(nowTs - newestTs) : null;
-
-    let latestFrame = null;
-    let latestTs = 0;
-    for (const f of ringBuf.frames) {
-      if (f.ts > latestTs) {
-        latestTs = f.ts;
-        latestFrame = f;
-      }
-    }
-
-    if (!latestFrame) {
-      if (frameCount === 0) {
-        if (Date.now() % 10000 < 500) {
-          console.log(`[watcher] [${cameraId}] Ring buffer empty (${frameCount} frames)`);
-        }
-        state.analyzeBackoff = Math.min(state.analyzeBackoff * 1.3, ANALYZE_BACKOFF_MAX_MS);
-        state.busy = false;
-        if (state.stopped !== STOP_SIGNAL) {
-          state.analyzeTimer = setTimeout(() => analyzeLoop(cameraId), state.analyzeBackoff);
-        }
-        return;
-      }
-    }
-
-    const frameAge = latestFrame ? (now - latestFrame.ts) : Infinity;
-
-    if (frameAge > COOLDOWN_MS + 5000) {
-      state.busy = false;
-      if (state.stopped !== STOP_SIGNAL) {
-        state.analyzeTimer = setTimeout(() => analyzeLoop(cameraId), state.analyzeInterval);
-      }
-      return;
-    }
-
-    // ── Run YOLO analysis ────────────────────────────────────────────────
-    const tmpAnalyze = path.join(os.tmpdir(), `analyze_${uuidv4()}.jpg`);
-    await fsp.writeFile(tmpAnalyze, latestFrame.buffer);
-
+    const tmpPath = path.join(os.tmpdir(), `unified_${uuidv4()}.jpg`);
+    await fsp.writeFile(tmpPath, frameBuf);
     let result;
     try {
-      result = await analyzeImage(tmpAnalyze, { skipPlate: true });
-      if (state.analyzeBackoff > ANALYZE_BACKOFF_INIT_MS) {
-        console.log(`[watcher] [${cameraId}] Analyzer recovered — resetting backoff`);
-      }
-      state.analyzeBackoff = ANALYZE_BACKOFF_INIT_MS;
-      state.analyzeInterval = ANALYZE_INTERVAL_MS;
+      result = await analyzeImage(tmpPath, { skipPlate: true });
     } catch (analyzeErr) {
-      state.analyzeBackoff = Math.min(state.analyzeBackoff * 2, ANALYZE_BACKOFF_MAX_MS);
-      state.analyzeInterval = Math.max(state.analyzeBackoff, ANALYZE_INTERVAL_MS + state.analyzeBackoff);
-      console.warn(`[watcher] [${cameraId}] Analyze failed: ${analyzeErr.message}, backoff=${state.analyzeBackoff}ms`);
-      try { await fsp.unlink(tmpAnalyze); } catch (_) { }
-      state.busy = false;
-      if (state.stopped !== STOP_SIGNAL) {
-        state.analyzeTimer = setTimeout(() => analyzeLoop(cameraId), state.analyzeBackoff);
-      }
+      console.warn(`[watcher] [${cameraId}] Cycle #${cycleNum} analyze failed: ${analyzeErr.message}`);
+      scheduleUnifiedCycle(cameraId, state, COOLDOWN_MS);
       return;
     } finally {
-      try { await fsp.unlink(tmpAnalyze); } catch (_) { }
+      try { await fsp.unlink(tmpPath); } catch (_) {}
     }
 
     const detections = detectionTags(result, camera);
-    const hasValidResult = result && typeof result.tags !== 'undefined';
 
-    if (hasValidResult && detections.length > 0) {
-      console.log(`[watcher] [${cameraId}] Detected: ${detections.join(',')} (age: ${Math.round(frameAge)}ms, buffer: ${frameCount} frames)`);
-    } else if (!hasValidResult) {
-      console.warn(`[watcher] [${cameraId}] Invalid analysis result`);
+    if (detections.length > 0) {
+      if (cycleNum <= 3 || state._analyzeLogCount % 10 === 0) {
+        console.log(`[watcher] [${cameraId}] Cycle #${cycleNum} — detections: ${detections.join(',')} (recording: ${state.isRecording})`);
+      }
+    } else if (cycleNum <= 3) {
+      console.log(`[watcher] [${cameraId}] Cycle #${cycleNum} — no detections`);
     }
     if (!state._analyzeLogCount) state._analyzeLogCount = 0;
     state._analyzeLogCount++;
-    if (state._analyzeLogCount % 30 === 1) {
-      console.log(`[watcher] [${cameraId}] Analyze tick #${state._analyzeLogCount} — buffer: ${frameCount} frames, detections: ${detections.length}, result valid: ${hasValidResult}`);
-    }
 
-    // ── Handle recording state ────────────────────────────────────────────
     if (state.isRecording) {
-      state.pendingFrames.push(latestFrame);
-      if (state.pendingFrames.length > MAX_PENDING_FRAMES) {
-        state.pendingFrames = state.pendingFrames.slice(-MAX_PENDING_FRAMES);
-      }
-
       if (detections.length > 0) {
-        state.lastDetectionAt = now;
+        state.lastDetectionAt = performance.now();
         state.consecutiveNoDetectionCycles = 0;
         state.pendingTags = mergeTags(state.pendingTags, detections);
         state.lastAnalysis = result.analysis || {};
+        await saveSnapshotEvent(cameraId, state, camera, frameBuf, result);
 
-        const recordingDuration = (now - state.recordingStartTs) / 1000;
+        const recordingDuration = (performance.now() - state.recordingStartTs) / 1000;
         if (recordingDuration >= MAX_CLIP_DURATION_SEC) {
           console.log(`[watcher] [${cameraId}] Max clip duration ${MAX_CLIP_DURATION_SEC}s — saving clip`);
           await saveClip(cameraId, state, camera);
@@ -1243,7 +1131,7 @@ async function analyzeLoop(cameraId) {
         }
       } else {
         if (state.lastDetectionAt !== null) {
-          const idleSec = (now - state.lastDetectionAt) / 1000;
+          const idleSec = (performance.now() - state.lastDetectionAt) / 1000;
           if (idleSec >= RECORDING_COOLDOWN_SEC) {
             console.log(`[watcher] [${cameraId}] Recording ended (cooldown ${RECORDING_COOLDOWN_SEC}s)`);
             await saveClip(cameraId, state, camera);
@@ -1253,8 +1141,8 @@ async function analyzeLoop(cameraId) {
         } else {
           state.consecutiveNoDetectionCycles = (state.consecutiveNoDetectionCycles || 0) + 1;
           if (state.consecutiveNoDetectionCycles >= RECORDING_MAX_IDLE_CYCLES) {
-            console.warn(`[watcher] [${cameraId}] Analyzer offline — forcing stop`);
-            if (state.pendingFrames.length >= MIN_CLIP_FRAMES || state.rtspMp4Path) {
+            console.warn(`[watcher] [${cameraId}] Too many idle cycles — forcing stop`);
+            if (state.pendingFrames.length >= MIN_CLIP_FRAMES) {
               await saveClip(cameraId, state, camera);
             }
             resetRecordingState(state);
@@ -1262,57 +1150,45 @@ async function analyzeLoop(cameraId) {
           }
         }
       }
-
-      state.busy = false;
-      if (state.stopped !== STOP_SIGNAL) {
-        state.analyzeTimer = setTimeout(() => analyzeLoop(cameraId), state.analyzeInterval);
-      }
+      scheduleUnifiedCycle(cameraId, state, state.isRecording ? DETECT_INTERVAL_MS : COOLDOWN_MS);
       return;
     }
 
-    // ── Not recording — check if should start ─────────────────────────────
-    if (detections.length > 0 && hasValidResult) {
-      const preFrames = ringBuf.getRecent(CLIP_BEFORE_SEC);
-      console.log(`[watcher] [${cameraId}] Starting recording — ${preFrames.length} pre-buffer frames + latest, detections: ${detections.join(',')}`);
+    if (detections.length > 0) {
+      console.log(`[watcher] [${cameraId}] Detection found — starting recording`);
+      const preFrames = state.ringBuffer.getRecent(CLIP_BEFORE_SEC);
 
       state.isRecording = true;
       state.recordingStart = new Date();
-      state.recordingStartTs = now;
-      state.lastDetectionAt = now;
-      state.pendingFrames = [...preFrames, latestFrame];
+      state.recordingStartTs = performance.now();
+      state.lastDetectionAt = performance.now();
+      state.pendingFrames = [...preFrames, entry];
       state.pendingTags = [...detections];
       state.recordedTags = [];
       state.lastAnalysis = result.analysis || {};
       state.consecutiveNoDetectionCycles = 0;
 
-      // Start RTSP direct recording for EZVIZ cameras
-      if (isEzvizSerialAddress(camera.ipAddress)) {
-        startRtspRecording(cameraId, state, camera).catch((err) => {
-          console.warn(`[watcher] [${cameraId}] RTSP recording start failed: ${err.message}`);
-        });
-      }
+      sendRecordingStart(String(cameraId), { cameraName: camera.name, tags: detections });
+      await saveSnapshotEvent(cameraId, state, camera, frameBuf, result);
 
-      sendRecordingStart(String(cameraId), {
-        cameraName: camera.name,
-        tags: detections,
-      });
-
-      await saveSnapshotEvent(cameraId, state, camera, latestFrame.buffer, result);
+      scheduleUnifiedCycle(cameraId, state, DETECT_INTERVAL_MS);
+      return;
     }
-
-    state.busy = false;
-    if (state.stopped !== STOP_SIGNAL) {
-      state.analyzeTimer = setTimeout(() => analyzeLoop(cameraId), state.analyzeInterval);
-    }
-
   } catch (err) {
-    console.warn(`[watcher] [${cameraId}] Analyze loop error: ${err.message}`);
-    state.analyzeBackoff = Math.min(state.analyzeBackoff * 2, ANALYZE_BACKOFF_MAX_MS);
-    state.busy = false;
-    if (state.stopped !== STOP_SIGNAL) {
-      state.analyzeTimer = setTimeout(() => analyzeLoop(cameraId), state.analyzeBackoff);
-    }
+    console.warn(`[watcher] [${cameraId}] Cycle #${cycleNum} error: ${err.message}`);
   }
+
+  scheduleUnifiedCycle(cameraId, state, COOLDOWN_MS);
+}
+
+function scheduleUnifiedCycle(cameraId, state, delayMs) {
+  if (!state || state.stopped === STOP_SIGNAL) return;
+  state.captureTimer = setTimeout(() => {
+    unifiedWatchCycle(cameraId).catch((err) => {
+      console.warn(`[watcher] [${cameraId}] unifiedWatchCycle uncaught: ${err.message}`);
+      scheduleUnifiedCycle(cameraId, state, COOLDOWN_MS);
+    });
+  }, delayMs);
 }
 
 // ── Save snapshot event ────────────────────────────────────────────────────
@@ -1429,17 +1305,12 @@ async function startWatch(cameraId, opts = {}) {
   }
 
   const useIpWebcam = isIpWebcamAddress(camera.ipAddress);
-  const useStreamBridge = !useIpWebcam;
 
   const buf = getBuffer(cameraId, { fps: 5, bufferSeconds: 30 });
 
   const state = {
-    busy: false,
-    busyStartTime: 0,
-    cycleStartTime: 0,
     camera,
     ringBuffer: buf,
-    useStreamBridge,
     startedAt: new Date(),
     stopped: undefined,
     isRecording: false,
@@ -1453,11 +1324,7 @@ async function startWatch(cameraId, opts = {}) {
     lastAnalysis: null,
     consecutiveNoDetectionCycles: 0,
     captureTimer: null,
-    analyzeTimer: null,
-    analyzeInterval: ANALYZE_INTERVAL_MS,
-    analyzeBackoff: ANALYZE_BACKOFF_INIT_MS,
     lastFrameAt: Date.now(),
-    lastBridgeCheck: Date.now(),
     // RTSP recording state
     rtspProc: null,
     rtspClipId: null,
@@ -1470,15 +1337,12 @@ async function startWatch(cameraId, opts = {}) {
 
   watchers.set(cameraId, state);
 
-  console.log(`[watcher] Starting for camera ${cameraId} (${camera.name}) — ${useIpWebcam ? 'IP Webcam (direct HTTP)' : 'EZVIZ (unified cycle)'}`);
+  console.log(`[watcher] Starting for camera ${cameraId} (${camera.name}) — ${useIpWebcam ? 'IP Webcam' : 'EZVIZ'}`);
   console.log(`[watcher] Detection config: targets=${(camera.watchDetectTargets || ['person', 'vehicle']).join(',')}, minConf=${camera.watchMinConfidence || 0.4}, minSize=${camera.watchMinPersonSize || 0}`);
 
   if (!useIpWebcam) {
-    // ── EZVIZ: unified watch cycle (capture + analyze + record in one loop) ──
-    // First cycle runs immediately, subsequent cycles every COOLDOWN_MS
-    console.log(`[watcher] [${cameraId}] Starting EZVIZ unified watch cycle (interval=${COOLDOWN_MS}ms)`);
-
-    if (useStreamBridge) {
+    // ── EZVIZ: unified watch cycle ──
+    if (isEzvizSerialAddress(camera.ipAddress)) {
       const result = startStreamBridge(cameraId, camera);
       if (!result.already) {
         console.log(`[watcher] Stream bridge started for ${cameraId} (background, for live preview)`);
@@ -1488,18 +1352,9 @@ async function startWatch(cameraId, opts = {}) {
     const firstDelay = opts.skipImmediateCapture ? 5000 : 0;
     scheduleEzvizCycle(cameraId, state, firstDelay);
   } else {
-    // ── IP Webcam: separate capture + analyze loops (high fps) ──
-    console.log(`[watcher] Using direct HTTP capture for IP Webcam (${camera.ipAddress})`);
-    state.captureTimer = setTimeout(() => {
-      captureLoop(cameraId).catch((err) => {
-        console.warn(`[watcher] [${cameraId}] captureLoop uncaught: ${err.message}`);
-      });
-    }, 0);
-    state.analyzeTimer = setTimeout(() => {
-      analyzeLoop(cameraId).catch((err) => {
-        console.warn(`[watcher] [${cameraId}] analyzeLoop uncaught: ${err.message}`);
-      });
-    }, 500);
+    // ── IP Webcam: unified watch cycle (same as EZVIZ) ──
+    console.log(`[watcher] Using unified cycle for IP Webcam (${camera.ipAddress})`);
+    scheduleUnifiedCycle(cameraId, state, opts.skipImmediateCapture ? 5000 : 0);
   }
 
   return { started: true };
@@ -1511,7 +1366,6 @@ async function stopWatch(cameraId) {
 
   state.stopped = STOP_SIGNAL;
   clearTimeout(state.captureTimer);
-  clearTimeout(state.analyzeTimer);
 
   // Stop RTSP recording if active
   if (state.rtspProc) {
