@@ -263,35 +263,6 @@ mongod --dbpath C:\data\db
 - The `backend/uploads/` and `backend/streams/` directories are gitignored (dynamic content).
 - All API routes except `/api/auth/*` and `/api/health` require JWT authentication.
 
-## API Routes Overview
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | /api/auth/register | User registration |
-| POST | /api/auth/login | User login (returns JWT) |
-| GET | /api/auth/profile | Get current user |
-| GET | /api/cameras | List cameras |
-| POST | /api/cameras | Create camera |
-| PUT | /api/cameras/:id | Update camera |
-| DELETE | /api/cameras/:id | Delete camera |
-| POST | /api/events/upload | Upload image (manual) |
-| GET | /api/events | List events (filter by cameraId, tag, date, plate) |
-| GET | /api/events/stats | Event statistics |
-| POST | /api/events/:id/reanalyze | Re-run AI analysis on event |
-| POST | /api/ipcam/capture/:cameraId | Capture from IP Webcam |
-| GET | /api/ipcam/stream/:id | MJPEG stream proxy |
-| POST | /api/ezviz/sync | Sync EZVIZ cameras |
-| POST | /api/ezviz/capture/:serial | Capture from EZVIZ |
-| POST | /api/watcher/start/:cameraId | Start auto-watch |
-| POST | /api/watcher/stop/:cameraId | Stop auto-watch |
-| GET | /api/watcher/status | List active watchers |
-| POST | /api/stream/start/:cameraId | Start RTSP stream (HLS) |
-| POST | /api/stream/stop/:cameraId | Stop RTSP stream |
-| POST | /api/stream/gif/:cameraId | Generate HTTP-GIF preview |
-| POST | /api/stream/clip | Generate clip from HLS segments |
-| GET | /api/blacklist/plates | List plate blacklist |
-| POST | /api/blacklist/plates | Add plate to blacklist |
-| DELETE | /api/blacklist/plates/:id | Remove from blacklist |
 
 ## Troubleshooting
 
