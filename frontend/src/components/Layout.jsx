@@ -7,7 +7,6 @@ import {
   Clock,
   Search,
   RectangleHorizontal,
-  UserCircle,
   UserRound,
   Settings,
   Plus,
@@ -24,7 +23,6 @@ const navItems = [
   { to: '/events', icon: Clock, label: 'Sự kiện' },
   { to: '/search', icon: Search, label: 'Tra cứu' },
   { to: '/plates', icon: RectangleHorizontal, label: 'Biển số xe' },
-  { to: '/faces', icon: UserCircle, label: 'Nhận diện người' },
 ];
 
 export default function Layout() {

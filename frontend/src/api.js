@@ -5,11 +5,7 @@ export function uploadsUrl(imagePath) {
   const name = raw.replace(/^uploads\//i, '');
   if (!name) return '';
   const base = import.meta.env.BASE_URL || '/';
-  const result = `${base}uploads/${name}`;
-  // #region agent log
-  fetch('http://127.0.0.1:7329/ingest/7003fb2f-82c9-4bde-8993-216e52b41cb5', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'a8b71c' }, body: JSON.stringify({ sessionId: 'a8b71c', runId: 'pre-fix', hypothesisId: 'H1', location: 'api.js:uploadsUrl', message: 'uploadsUrl_called', data: { imagePath, raw, name, result }, timestamp: Date.now() }) }).catch(() => {});
-  // #endregion
-  return result;
+  return `${base}uploads/${name}`;
 }
 
 const TOKEN_KEY = 'vg_token';

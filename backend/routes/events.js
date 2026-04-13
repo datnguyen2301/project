@@ -79,7 +79,7 @@ router.post('/upload', upload.single('image'), async (req, res) => {
 
 router.get('/', async (req, res) => {
   try {
-    const { cameraId, dateFrom, dateTo, tag, search, plate, minPersons, hasVehicle, page = 1, limit = 20 } = req.query;
+    const { cameraId, dateFrom, dateTo, tag, search, plate, minPersons, hasVehicle, type, page = 1, limit = 20 } = req.query;
     const filter = {};
 
     if (cameraId) filter.cameraId = cameraId;
@@ -99,26 +99,32 @@ router.get('/', async (req, res) => {
     if (hasVehicle === 'true') {
       filter['analysis.vehicles.0'] = { $exists: true };
     }
+    if (type === 'image') {
+      filter.videoPath = { $exists: false };
+      filter.type = { $ne: 'clip' };
+    } else if (type === 'clip') {
+      filter.$or = [
+        { type: 'clip' },
+        { videoPath: { $regex: /\.(mp4|gif|webm|avi|mov)$/i } },
+      ];
+    }
+    // type=all: lấy tất cả (image + video), không lọc theo type
 
     const baseFilter = { ...filter };
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const [events, total, imageTotal, clipTotal] = await Promise.all([
+    const [events, total] = await Promise.all([
       Event.find(filter)
         .populate('cameraId', 'name location')
         .sort({ capturedAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
       Event.countDocuments(filter),
-      Event.countDocuments({ ...baseFilter, $and: [{ videoPath: { $exists: false } }, { type: { $ne: 'clip' } }] }),
-      Event.countDocuments({ $or: [{ type: 'clip' }, { videoPath: { $exists: true } }] }),
     ]);
 
     res.json({
       events,
       total,
-      imageTotal,
-      clipTotal,
       page: parseInt(page),
       totalPages: Math.ceil(total / parseInt(limit)),
     });

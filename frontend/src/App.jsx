@@ -8,7 +8,6 @@ import Cameras from './pages/Cameras';
 import UploadPage from './pages/UploadPage';
 import SearchPage from './pages/SearchPage';
 import PlatesPage from './pages/PlatesPage';
-import FacesPage from './pages/FacesPage';
 import SettingsPage from './pages/SettingsPage';
 import ProfilePage from './pages/ProfilePage';
 import LoginPage from './pages/LoginPage';
@@ -32,7 +31,6 @@ export default function App() {
               <Route path="upload" element={<UploadPage />} />
               <Route path="search" element={<SearchPage />} />
               <Route path="plates" element={<PlatesPage />} />
-              <Route path="faces" element={<FacesPage />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="profile" element={<ProfilePage />} />
             </Route>
