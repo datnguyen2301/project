@@ -1,0 +1,22 @@
+{
+  "watch": ["server.js", "routes", "services", "models", "scripts", "utils", "middleware", "package.json"],
+  "ignore": [
+    "streams/**",
+    "streams",
+    "uploads/**",
+    "uploads",
+    "clips/**",
+    "clips",
+    "node_modules/**",
+    "node_modules",
+    "*.ts",
+    "*.m3u8",
+    "*.mp4"
+  ],
+  "ext": "js,mjs,cjs,json",
+  "delay": "3000",
+  "events": {
+    "restart": "echo nodemon restarted",
+    "crash": "echo nodemon crashed"
+  }
+}

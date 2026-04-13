@@ -1,0 +1,24 @@
+node_modules/
+backend/uploads/
+frontend/dist/
+backend/.env
+package-lock.json
+
+# Debug logs
+.cursor/debug-*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# YOLO models (lớn, có thể tự tải)
+backend/models/yolov8*.pt
+backend/yolov8*.pt
+
+# HLS streams
+backend/streams/
+
+# IDE
+.idea/
+.vscode/
