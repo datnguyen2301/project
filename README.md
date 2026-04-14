@@ -109,12 +109,7 @@ d:\project\
 - Ring buffer for continuous recording (configurable duration)
 - Clip generation from recorded segments
 
-### 5. License Plate Recognition
-- Automatic plate detection via YOLO + EasyOCR
-- Blacklist management for flagged plates
-- Plate search and history
-
-### 6. Authentication
+### 5. Authentication
 - JWT-based user authentication
 - Role-based access (user registration/login)
 - Protected API routes
