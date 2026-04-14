@@ -89,7 +89,6 @@ d:\project\
 ### 1. Camera Management
 - Add/edit/delete IP cameras (IP Webcam, EZVIZ, RTSP)
 - Live preview via MJPEG proxy or HLS streaming
-- One-click capture and manual upload
 
 ### 2. Auto-Watch (AI Detection)
 - Background watcher captures every 5 seconds
