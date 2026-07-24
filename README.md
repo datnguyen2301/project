@@ -109,6 +109,36 @@ d:\project\
 - Ring buffer for continuous recording (configurable duration)
 - Clip generation from recorded segments
 
+### 4b. EZVIZ Cloud Live Streaming (off-LAN)
+
+For EZVIZ cameras that are **not** on the server's network, `startStream` falls
+back to `services/ezvizCloudStream.js`, which streams over EZVIZ's own cloud:
+
+- Authenticates with the **account email/password** (as the EZVIZ app does), not
+  an Open Platform `appKey` — so it is not limited by the Open Platform
+  streaming package (which returns `ErrCode 9053` once exhausted).
+- Pulls video over an **outbound TCP** connection to EZVIZ's VTM/VTDU relays, so
+  it works behind symmetric NAT, where UDP hole-punching fails.
+- The camera emits H.265; FFmpeg transcodes to H.264 HLS for browser playback.
+
+Local RTSP is still preferred whenever a configured `rtspHost` actually answers.
+
+**Requires a helper binary** (not committed — ~24MB):
+
+```bash
+git clone https://github.com/LethalEthan/LE-EZVIZ-VS
+cd LE-EZVIZ-VS && go build -o le-ezviz-vs .
+# place the binary at backend/bin/le-ezviz-vs.exe (or set EZVIZ_VS_PATH)
+```
+
+Two local patches are needed for continuous piping — a `-pipe` flag that writes
+the raw Annex-B HEVC to stdout (with logs moved to stderr), and `io.ReadFull`
+for the VTDU header/body reads, since `net.Conn.Read` may return partial data
+and desyncs the packet parser otherwise.
+
+> Caveats: the upstream project is beta and reverse-engineered, and the camera's
+> **Image Encryption must be off** (E2EE is not implemented yet).
+
 ### 5. Authentication
 - JWT-based user authentication
 - Role-based access (user registration/login)
@@ -174,6 +204,14 @@ IP_WEBCAM_URL=http://192.168.1.xxx:xxxx
 EZVIZ_EMAIL=your@email.com
 EZVIZ_PASSWORD=yourpassword
 EZVIZ_REGION=apiisgp
+
+# EZVIZ cloud streaming (optional — see "EZVIZ Cloud Live Streaming")
+# Region name is derived from EZVIZ_REGION; override only if needed.
+# EZVIZ_VS_PATH=backend/bin/le-ezviz-vs.exe
+# EZVIZ_VS_REGION=Asia
+# Output size/bitrate of the transcoded HLS (camera sends 2880x1620).
+# EZVIZ_STREAM_HEIGHT=720
+# EZVIZ_STREAM_BITRATE=2000k
 
 # Optional
 RESTORE_AUTOWATCH_ON_START=true

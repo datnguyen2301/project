@@ -405,11 +405,14 @@ export default function Cameras() {
                     {isEzvizStyleCamera(cam) && ' (EZVIZ)'}
                   </div>
 
-                  {preview === cam._id && hlsActive && (
+                  {/* Gated on hlsActive alone: a stream that is actually running
+                      should be visible, including after a page reload where
+                      `preview` starts null. */}
+                  {hlsActive && (
                     <div className="camera-preview" style={{ marginTop: 8 }}>
                       <HlsPlayer
                         src={hlsStreams[sid]}
-                        style={{ width: '100%', maxHeight: 320, borderRadius: 6 }}
+                        style={{ width: '100%', height: 320, borderRadius: 6 }}
                       />
                     </div>
                   )}

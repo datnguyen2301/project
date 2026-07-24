@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const Camera = require('../models/Camera');
 const ezviz = require('./ezviz');
+const ezvizCloud = require('./ezvizCloudStream');
 const { isIpWebcamAddress } = require('../utils/cameraAddress');
 
 function getFfmpegPath() {
@@ -44,6 +45,9 @@ async function startStream(cameraId) {
   if (streams.has(cameraId)) {
     return { already: true, hlsUrl: hlsUrl(cameraId) };
   }
+  if (ezvizCloud.isStreaming(cameraId)) {
+    return { already: true, hlsUrl: ezvizCloud.hlsUrl(cameraId) };
+  }
 
   const camera = await Camera.findById(cameraId);
   if (!camera?.ipAddress) throw new Error('Camera not found or has no address');
@@ -52,8 +56,29 @@ async function startStream(cameraId) {
     throw new Error('IP Webcam đã hỗ trợ MJPEG stream; không cần FFmpeg HLS.');
   }
 
-  let streamInfo;
+  // Local RTSP is preferable when the camera really is on this network (lower
+  // latency, no cloud dependency), so only probe it when an rtspHost is set AND
+  // it actually answers — a stale address from another network must not block
+  // the cloud path below.
+  let rtspHostReachable = false;
   if (camera.rtspHost) {
+    const [lanHost, lanPort] = camera.rtspHost.split(':');
+    rtspHostReachable = await checkTcpReachable(lanHost, Number(lanPort || 554), 2000);
+    console.log(`[stream] rtspHost ${camera.rtspHost} → ${rtspHostReachable ? 'reachable' : 'unreachable, ignoring'}`);
+  }
+
+  // EZVIZ cloud (consumer protocol over TCP relay): works off-LAN and behind
+  // symmetric NAT, and is not subject to the Open Platform streaming quota.
+  if (!rtspHostReachable && ezvizCloud.isConfigured()) {
+    try {
+      return await ezvizCloud.start(cameraId, String(camera.ipAddress).trim());
+    } catch (err) {
+      console.warn(`[stream] EZVIZ cloud stream failed: ${err.message} — falling back to RTSP`);
+    }
+  }
+
+  let streamInfo;
+  if (camera.rtspHost && rtspHostReachable) {
     const [host, port] = camera.rtspHost.split(':');
     streamInfo = { localIp: host, rtspPort: port || '554', camKey: camera.verifyCode || '' };
     console.log(`[stream] Using local rtspHost: ${host}:${streamInfo.rtspPort}`);
@@ -329,6 +354,10 @@ function startFfmpegHls(cameraId, candidate) {
 }
 
 function stopStream(cameraId) {
+  if (ezvizCloud.isStreaming(cameraId)) {
+    return ezvizCloud.stop(cameraId);
+  }
+
   const state = streams.get(cameraId);
   if (!state) return { already: true };
 
@@ -361,11 +390,11 @@ function getStatus() {
       url: state.url ? state.url.replace(/:[^:@]+@/, ':***@') : 'unknown',
     });
   }
-  return result;
+  return result.concat(ezvizCloud.getStatus());
 }
 
 function isStreaming(cameraId) {
-  return streams.has(cameraId);
+  return streams.has(cameraId) || ezvizCloud.isStreaming(cameraId);
 }
 
 function checkFfmpeg() {
