@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import Hls from 'hls.js';
 
 export default function HlsPlayer({
   src,
@@ -47,93 +46,115 @@ export default function HlsPlayer({
       ? src
       : new URL(src, window.location.origin).href;
 
+    // Named handlers so they can be detached on cleanup. Previously these were
+    // anonymous and never removed, so every src change stacked another set of
+    // listeners on the same <video>.
+    const onPlaying = () => { setError(null); setLoading(false); };
+    const onWaiting = () => setLoading(true);
+    const onCanPlay = () => setLoading(false);
+
+    video.addEventListener('playing', onPlaying);
+    video.addEventListener('waiting', onWaiting);
+    video.addEventListener('canplay', onCanPlay);
+
+    const detachVideoEvents = () => {
+      video.removeEventListener('playing', onPlaying);
+      video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('canplay', onCanPlay);
+    };
+
     if (nativeMpegUrl === 'probably') {
       video.src = manifestUrl;
       video.load();
       if (autoPlay) video.play().catch(() => {});
-      return () => {};
+      return detachVideoEvents;
     }
 
-    if (!Hls.isSupported()) {
-      setError('HLS not supported in this browser');
-      setLoading(false);
-      return () => {};
-    }
+    // hls.js is by far the heaviest dependency in the app and is only needed on
+    // browsers without native HLS, and only once a stream is actually shown.
+    // Loading it on demand keeps it out of the initial bundle.
+    let cancelled = false;
+    let hls = null;
 
-    const hls = new Hls({
-      enableWorker: true,
-      lowLatencyMode: true,
-      liveSyncDurationCount: 2,
-      liveMaxLatencyDurationCount: 5,
-      maxBufferLength: 8,
-      maxMaxBufferLength: 15,
-      backBufferLength: 5,
-      liveDurationInfinity: true,
-      manifestLoadingMaxRetry: 6,
-      manifestLoadingRetryDelay: 500,
-      levelLoadingMaxRetry: 6,
-      levelLoadingRetryDelay: 500,
-      fragLoadingMaxRetry: 10,
-      fragLoadingRetryDelay: 500,
-      startLevel: -1,
-      nudgeMaxRetry: 5,
-      nudgeOffset: 0.2,
-    });
+    import('hls.js')
+      .then(({ default: Hls }) => {
+        if (cancelled) return;
 
-    hlsRef.current = hls;
-    hls.loadSource(manifestUrl);
-    hls.attachMedia(video);
+        if (!Hls.isSupported()) {
+          setError('HLS not supported in this browser');
+          setLoading(false);
+          return;
+        }
 
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      if (autoPlay) video.play().catch(() => {});
-    });
+        hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: true,
+          liveSyncDurationCount: 2,
+          liveMaxLatencyDurationCount: 5,
+          maxBufferLength: 8,
+          maxMaxBufferLength: 15,
+          backBufferLength: 5,
+          liveDurationInfinity: true,
+          manifestLoadingMaxRetry: 6,
+          manifestLoadingRetryDelay: 500,
+          levelLoadingMaxRetry: 6,
+          levelLoadingRetryDelay: 500,
+          fragLoadingMaxRetry: 10,
+          fragLoadingRetryDelay: 500,
+          startLevel: -1,
+          nudgeMaxRetry: 5,
+          nudgeOffset: 0.2,
+        });
 
-    hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (!data.fatal) return;
+        hlsRef.current = hls;
+        hls.loadSource(manifestUrl);
+        hls.attachMedia(video);
 
-      const msg = `HLS error: ${data.type} / ${data.details}`;
-      console.warn(`[HlsPlayer] ${msg}`);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (autoPlay) video.play().catch(() => {});
+        });
 
-      switch (data.type) {
-        case Hls.ErrorTypes.NETWORK_ERROR:
-          setError('Lỗi mạng — đang thử lại...');
-          scheduleRetry(hls);
-          break;
-        case Hls.ErrorTypes.MEDIA_ERROR:
-          setError('Lỗi media — đang khôi phục...');
-          hls.recoverMediaError();
-          retryTimerRef.current = setTimeout(() => {
-            if (hlsRef.current) setError(null);
-          }, 5000);
-          break;
-        case Hls.ErrorTypes.KEY_SYSTEM_ERROR:
-        case Hls.ErrorTypes.M3U8_ERROR:
-        case Hls.ErrorTypes.OTHER_ERROR:
-        default:
-          setError(msg);
-          if (onError) onError(msg);
-          hls.destroy();
-          hlsRef.current = null;
-          break;
-      }
-    });
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (!data.fatal) return;
 
-    video.addEventListener('playing', () => {
-      setError(null);
-      setLoading(false);
-    });
+          const msg = `HLS error: ${data.type} / ${data.details}`;
+          console.warn(`[HlsPlayer] ${msg}`);
 
-    video.addEventListener('waiting', () => {
-      setLoading(true);
-    });
-
-    video.addEventListener('canplay', () => {
-      setLoading(false);
-    });
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              setError('Lỗi mạng — đang thử lại...');
+              scheduleRetry(hls);
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              setError('Lỗi media — đang khôi phục...');
+              hls.recoverMediaError();
+              retryTimerRef.current = setTimeout(() => {
+                if (hlsRef.current) setError(null);
+              }, 5000);
+              break;
+            case Hls.ErrorTypes.KEY_SYSTEM_ERROR:
+            case Hls.ErrorTypes.M3U8_ERROR:
+            case Hls.ErrorTypes.OTHER_ERROR:
+            default:
+              setError(msg);
+              if (onError) onError(msg);
+              hls.destroy();
+              hlsRef.current = null;
+              break;
+          }
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setError('Không tải được trình phát HLS');
+        setLoading(false);
+      });
 
     return () => {
+      cancelled = true;
       clearRetry();
-      hls.destroy();
+      detachVideoEvents();
+      if (hls) hls.destroy();
       hlsRef.current = null;
     };
   }, [src, autoPlay, onError]);

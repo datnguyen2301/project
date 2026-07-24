@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { useEffect, useState, useCallback, useRef, useLayoutEffect } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { format } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import {
@@ -25,11 +25,30 @@ const navItems = [
   { to: '/plates', icon: RectangleHorizontal, label: 'Biển số xe' },
 ];
 
+/**
+ * The ticking clock lives in its own component so its 1Hz state update only
+ * re-renders this one line of text. Held in Layout it re-rendered the whole
+ * layout — and with it the entire routed page under <Outlet /> — every second.
+ */
+function LiveClock() {
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  return (
+    <div className="topbar-sub">
+      {format(now, "EEEE, dd/MM/yyyy — HH:mm:ss", { locale: vi })}
+    </div>
+  );
+}
+
 export default function Layout() {
   const navigate = useNavigate();
   const location = useLocation();
   const addToast = useToast();
-  const [time, setTime] = useState(new Date());
   const [todayCount, setTodayCount] = useState(0);
   const [dark, setDark] = useState(() => localStorage.getItem('theme') === 'dark');
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -40,46 +59,8 @@ export default function Layout() {
   const logoTextRef = useRef(null);
   const logoSubRef = useRef(null);
 
-  // #region agent log
-  useLayoutEffect(() => {
-    const run = () => {
-      const aside = sidebarRef.current;
-      const container = sidebarLogoRef.current;
-      const textEl = logoTextRef.current;
-      const subEl = logoSubRef.current;
-      if (!aside || !container || !textEl || !subEl) return;
-      const ccs = getComputedStyle(container);
-      const subCs = getComputedStyle(subEl);
-      const lh = parseFloat(subCs.lineHeight) || 14;
-      const data = {
-        sidebarW: aside.clientWidth,
-        containerInnerW: container.clientWidth,
-        flexGap: ccs.gap,
-        paddingH: parseFloat(ccs.paddingLeft) + parseFloat(ccs.paddingRight),
-        logoTextW: textEl.getBoundingClientRect().width,
-        subClientW: subEl.clientWidth,
-        subScrollW: subEl.scrollWidth,
-        subOffsetH: subEl.offsetHeight,
-        subLineHeightPx: lh,
-        H_A_rowCrowding: textEl.getBoundingClientRect().width + parseFloat(ccs.columnGap || ccs.gap || 0) + subEl.scrollWidth > container.clientWidth,
-        H_B_subOverflow: subEl.scrollWidth > subEl.clientWidth,
-        H_C_multiLine: subEl.offsetHeight > lh * 1.4,
-      };
-      fetch('http://127.0.0.1:7329/ingest/7003fb2f-82c9-4bde-8993-216e52b41cb5', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'a8b71c' }, body: JSON.stringify({ sessionId: 'a8b71c', runId: 'post-fix', location: 'Layout.jsx:sidebarLogo', message: 'sidebar logo layout measure', data: { ...data, layoutVariant: 'stacked' }, timestamp: Date.now(), hypothesisId: 'A-E' }) }).catch(() => {});
-    };
-    run();
-    window.addEventListener('resize', run);
-    return () => window.removeEventListener('resize', run);
-  }, []);
-  // #endregion
-
   // Cameras page uses SSE watcher, no toast needed there to avoid duplicate notifications
   const isCamerasPage = location.pathname === '/cameras' || location.pathname === '/';
-
-  useEffect(() => {
-    const t = setInterval(() => setTime(new Date()), 1000);
-    return () => clearInterval(t);
-  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
@@ -145,7 +126,6 @@ export default function Layout() {
     return () => document.removeEventListener('keydown', handler);
   }, []);
 
-  const dateStr = format(time, "EEEE, dd/MM/yyyy — HH:mm:ss", { locale: vi });
 
   return (
     <div className="app-shell">
@@ -226,7 +206,7 @@ export default function Layout() {
           </button>
           <div>
             <div className="topbar-title"><span className="dot" />Hệ thống đang hoạt động</div>
-            <div className="topbar-sub">{dateStr}</div>
+            <LiveClock />
           </div>
           <div className="topbar-right">
             <button className="theme-toggle" onClick={() => setDark((d) => !d)} aria-label={dark ? 'Chuyển light mode' : 'Chuyển dark mode'} title={dark ? 'Light mode' : 'Dark mode'}>

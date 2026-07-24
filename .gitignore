@@ -30,3 +30,6 @@ backend/streams/
 # Test images
 backend/models/_warmup_tmp.jpg
 backend/models/test_car.jpg
+
+# EZVIZ cloud-stream helper binary (build from LE-EZVIZ-VS, see README)
+backend/bin/

@@ -20,6 +20,21 @@ process.on('unhandledRejection', (reason, promise) => {
   }
 });
 
+// EZVIZ cloud streams run helper + ffmpeg child processes; reap them on exit so
+// a restart doesn't leave orphans holding the camera session. SIGUSR2 is what
+// nodemon sends before reloading, and it must re-raise rather than exit(0) or
+// the reload stalls.
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGUSR2']) {
+  process.once(sig, () => {
+    try { require('./services/ezvizCloudStream').stopAll(); } catch (_) {}
+    if (sig === 'SIGUSR2') {
+      process.kill(process.pid, sig);
+    } else {
+      process.exit(0);
+    }
+  });
+}
+
 const camerasRouter = require('./routes/cameras');
 const eventsRouter = require('./routes/events');
 const ezvizRouter = require('./routes/ezviz');
