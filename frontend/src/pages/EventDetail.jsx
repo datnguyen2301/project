@@ -49,6 +49,14 @@ export default function EventDetail() {
     }
   };
 
+  // Return to the page the user actually came from (Biển số xe, Tra cứu,
+  // Dashboard…), not a hardcoded /events. React Router keeps a history index in
+  // history.state.idx; idx > 0 means there is a previous in-app entry to pop.
+  const goBack = () => {
+    if (window.history.state?.idx > 0) navigate(-1);
+    else navigate('/events');
+  };
+
   useEffect(() => {
     const handler = (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
@@ -74,7 +82,14 @@ export default function EventDetail() {
 
   const { analysis } = event;
   const tagLabel = (t) => {
-    const map = { 'auto-watch': 'Auto-watch', person: 'Người', vehicle: 'Xe', plate: 'Biển số' };
+    const map = {
+      'auto-watch': 'Auto-watch',
+      person: 'Người',
+      vehicle: 'Xe',
+      plate: 'Biển số',
+      stranger: 'NGƯỜI LẠ',
+      'known-person': 'Người quen',
+    };
     return map[t] || t;
   };
   const currentIdx = timeline.findIndex(ev => ev._id === id);
@@ -85,7 +100,7 @@ export default function EventDetail() {
     <>
       <div className="detail-header">
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <button className="btn" onClick={() => navigate('/events')} aria-label="Quay lại">
+          <button className="btn" onClick={goBack} aria-label="Quay lại">
             <ArrowLeft size={14} /> Quay lại
           </button>
           {prevEvent && (

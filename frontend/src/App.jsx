@@ -16,6 +16,7 @@ const PlaybackPage = lazy(() => import('./pages/PlaybackPage'));
 const UploadPage = lazy(() => import('./pages/UploadPage'));
 const SearchPage = lazy(() => import('./pages/SearchPage'));
 const PlatesPage = lazy(() => import('./pages/PlatesPage'));
+const FacesPage = lazy(() => import('./pages/FacesPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const ProfilePage = lazy(() => import('./pages/ProfilePage'));
 const RegisterPage = lazy(() => import('./pages/RegisterPage'));
@@ -62,6 +63,7 @@ export default function App() {
                 <Route path="upload" element={<UploadPage />} />
                 <Route path="search" element={<SearchPage />} />
                 <Route path="plates" element={<PlatesPage />} />
+                <Route path="faces" element={<FacesPage />} />
                 <Route path="settings" element={<SettingsPage />} />
                 <Route path="profile" element={<ProfilePage />} />
               </Route>

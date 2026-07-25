@@ -49,6 +49,7 @@ const authRouter = require('./routes/auth');
 const blacklistRouter = require('./routes/blacklist');
 const streamRouter = require('./routes/stream');
 const playbackRouter = require('./routes/playback');
+const facesRouter = require('./routes/faces');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -106,6 +107,7 @@ app.use('/api/watcher', authMiddleware, watcherRouter);
 app.use('/api/blacklist', authMiddleware, blacklistRouter);
 app.use('/api/stream', authMiddleware, streamRouter);
 app.use('/api/playback', authMiddleware, playbackRouter);
+app.use('/api/faces', authMiddleware, facesRouter);
 
 // ── Express global error handler — catches all unhandled route errors ──
 app.use((err, _req, res, _next) => {

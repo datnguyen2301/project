@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Pencil, Trash2, Wifi, WifiOff, RefreshCw, Camera as CameraIcon, Eye, EyeOff, Radio, Square, Play, StopCircle, AlertCircle, Video, Circle } from 'lucide-react';
 import { api, uploadsUrl } from '../api';
+import { useToast } from '../components/Toast';
 import CameraForm from '../components/CameraForm';
 import { isIpWebcamCamera, isEzvizStyleCamera } from '../utils/cameraSource';
 import EzvizLiveFrame from '../components/EzvizLiveFrame';
@@ -24,6 +25,7 @@ function LivePreview({ cameraId }) {
 
 export default function Cameras() {
   const navigate = useNavigate();
+  const addToast = useToast();
   const [cameras, setCameras] = useState([]);
   const [editing, setEditing] = useState(null);
   const [showForm, setShowForm] = useState(false);
@@ -127,6 +129,36 @@ export default function Cameras() {
         const status = JSON.parse(e.data);
         const ids = new Set(status.map((s) => String(s.cameraId)));
         setWatching(ids);
+      } catch (_) {}
+    });
+
+    // Face recognition — two distinct signals.
+    // Unknown face: red warning, stays on screen noticeably longer.
+    es.addEventListener('stranger-alert', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        const n = data.strangerCount || 1;
+        const withKnown = data.knownNames?.length
+          ? ` (đi cùng ${data.knownNames.join(', ')})`
+          : '';
+        addToast(
+          `⚠ NGƯỜI LẠ — ${n} khuôn mặt không xác định tại ${data.cameraName || 'camera'}${withKnown}`,
+          'error',
+          12000
+        );
+      } catch (_) {}
+    });
+
+    // Recognised face: quiet green notice naming who arrived.
+    es.addEventListener('known-person-alert', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        const names = (data.names || []).join(', ');
+        addToast(
+          `✓ Người quen: ${names} tại ${data.cameraName || 'camera'}`,
+          'success',
+          4000
+        );
       } catch (_) {}
     });
 
@@ -412,7 +444,10 @@ export default function Cameras() {
                     <div className="camera-preview" style={{ marginTop: 8 }}>
                       <HlsPlayer
                         src={hlsStreams[sid]}
-                        style={{ width: '100%', height: 320, borderRadius: 6 }}
+                        recordable
+                        detectOverlay
+                        recordLabel={cam.name?.replace(/[^\w-]+/g, '_') || 'camera'}
+                        style={{ width: '100%' }}
                       />
                     </div>
                   )}

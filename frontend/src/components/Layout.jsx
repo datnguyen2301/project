@@ -8,6 +8,7 @@ import {
   History,
   Search,
   RectangleHorizontal,
+  ScanFace,
   UserRound,
   Settings,
   Plus,
@@ -25,6 +26,7 @@ const navItems = [
   { to: '/playback', icon: History, label: 'Xem lại' },
   { to: '/search', icon: Search, label: 'Tra cứu' },
   { to: '/plates', icon: RectangleHorizontal, label: 'Biển số xe' },
+  { to: '/faces', icon: ScanFace, label: 'Khuôn mặt' },
 ];
 
 /**

@@ -37,6 +37,10 @@ async function request(url, options = {}) {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     const err = new Error(body.error || `Request failed: ${res.status}`);
+    // Keep the full payload: some endpoints answer an error status with data the
+    // caller needs (e.g. 409 from /faces/from-event lists the faces to pick from).
+    err.status = res.status;
+    err.body = body;
     if (res.status === 401) {
       err.unauthorized = true;
       clearToken();
@@ -144,6 +148,19 @@ export const api = {
       body: JSON.stringify({ enabled }),
     }),
   playbackRecorderStatus: () => request('/playback/record/status'),
+
+  // Known persons (face recognition)
+  getFaces: () => request('/faces'),
+  addFace: (formData) => request('/faces', { method: 'POST', body: formData }),
+  deleteFace: (id) => request(`/faces/${id}`, { method: 'DELETE' }),
+  getRecentStrangers: (limit = 20) => request(`/faces/strangers/recent?limit=${limit}`),
+  // Enroll from an image already stored in the database (a captured event).
+  getFaceCandidates: (limit = 40) => request(`/faces/candidates?limit=${limit}`),
+  addFaceFromEvent: (name, eventId, faceIndex) =>
+    request('/faces/from-event', {
+      method: 'POST',
+      body: JSON.stringify({ name, eventId, faceIndex }),
+    }),
 
   login: (username, password) =>
     request('/auth/login', {

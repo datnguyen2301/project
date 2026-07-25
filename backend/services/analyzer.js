@@ -102,7 +102,7 @@ async function analyzeImageImmediate(imagePath, opts = {}) {
 }
 
 async function analyzeImage(imagePath, opts = {}) {
-  const { skipPlate = false } = opts;
+  const { skipPlate = false, faces = false } = opts;
 
   if (analyzerAvailable === null) {
     await checkHealth();
@@ -117,7 +117,7 @@ async function analyzeImage(imagePath, opts = {}) {
       res = await fetch(ANALYZER_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imagePath, skip_plate: skipPlate }),
+        body: JSON.stringify({ imagePath, skip_plate: skipPlate, faces }),
         signal: controller.signal,
       });
     } finally {
@@ -159,9 +159,29 @@ async function analyzeImage(imagePath, opts = {}) {
 
 function fallback() {
   return {
-    analysis: { persons: [], vehicles: [], licensePlates: [] },
+    analysis: { persons: [], vehicles: [], licensePlates: [], faces: [] },
     tags: [],
   };
+}
+
+/** Extract face embeddings only (known-person enrollment). */
+async function extractFaces(imagePath) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000);
+  try {
+    const res = await fetch(ANALYZER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imagePath, faces_only: true }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`analyzer HTTP ${res.status}`);
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || 'analyzer error');
+    return json.data?.faces || [];
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 async function analyzeEventMedia(event) {
@@ -186,4 +206,4 @@ async function analyzeEventMedia(event) {
   return analyzeImage(path.join(UPLOADS_DIR, event.imagePath));
 }
 
-module.exports = { analyzeImage, analyzeImageImmediate, analyzeEventMedia, checkHealth };
+module.exports = { analyzeImage, analyzeImageImmediate, analyzeEventMedia, extractFaces, checkHealth };

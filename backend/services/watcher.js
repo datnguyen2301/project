@@ -27,6 +27,14 @@ const CLIPS_DIR = path.join(UPLOADS_DIR, 'clips');
 const COOLDOWN_MS = 3000;
 const DETECT_INTERVAL_MS = 1500;
 
+// When false (default), the watcher still captures, analyzes, and saves detection
+// snapshots, but does NOT auto-record a video clip while a person/vehicle is
+// present. Set WATCH_RECORD_ON_DETECTION=true to re-enable presence-triggered
+// clip recording. (This is separate from the 24/7 continuous recorder, which is
+// controlled by the camera's `autoRecord` flag.)
+const RECORD_ON_DETECTION =
+  String(process.env.WATCH_RECORD_ON_DETECTION ?? 'false').trim().toLowerCase() === 'true';
+
 // ── Recording constants (optimized) ────────────────────────────────────────
 const CLIP_BEFORE_SEC = 10;
 const MAX_CLIP_DURATION_SEC = 30;
@@ -418,7 +426,13 @@ async function captureOneFrame(camera, opts = {}) {
       );
       const captureData = await Promise.race([capturePromise, timeoutPromise]);
       const picUrl = captureData?.picUrl;
-      if (picUrl) {
+      // EZVIZ cloud "capture" returns the last ALARM snapshot, not a live frame —
+      // it can be hours/days old. Only analyze it if it's recent, otherwise the
+      // watcher "detects" whoever triggered the last alarm (e.g. yesterday).
+      const picTime = captureData?.picTime;
+      const maxAlarmAgeMs = parseInt(process.env.WATCH_EZVIZ_ALARM_MAX_AGE_MS || '60000', 10);
+      const alarmAgeMs = typeof picTime === 'number' ? Date.now() - picTime : Infinity;
+      if (picUrl && alarmAgeMs <= maxAlarmAgeMs) {
         const imgRes = await fetch(picUrl, {
           signal: AbortSignal.timeout(cloudTimeoutMs),
           headers: { 'User-Agent': FETCH_IMAGE_UA },
@@ -428,9 +442,12 @@ async function captureOneFrame(camera, opts = {}) {
           if (bufferLooksLikeImage(buf)) {
             await fsp.writeFile(tmpPath, buf);
             ok = true;
-            console.log(`[watcher] [${cameraId}] EZVIZ cloud OK (${buf.length} bytes)`);
+            console.log(`[watcher] [${cameraId}] EZVIZ cloud OK (${buf.length} bytes, alarm age ${Math.round(alarmAgeMs / 1000)}s)`);
           }
         }
+      } else if (picUrl) {
+        const ageStr = Number.isFinite(alarmAgeMs) ? `${Math.round(alarmAgeMs / 1000)}s` : 'unknown';
+        console.log(`[watcher] [${cameraId}] Skipping stale EZVIZ cloud alarm image (age ${ageStr}) — using live source instead`);
       }
     } catch (cloudErr) {
       if (cloudErr.message) {
@@ -899,6 +916,73 @@ function mergeTags(existing, incoming) {
   return [...merged];
 }
 
+// ── Face identity: match against enrolled persons, alert on strangers ───────
+
+const STRANGER_ALERT_COOLDOWN_MS = parseInt(process.env.STRANGER_ALERT_COOLDOWN_MS || '60000', 10);
+// Known people are routine, so their "welcome" notice is rate-limited per PERSON
+// and much less often than a stranger warning: if Bố is around for an hour you
+// want one greeting, but if Mẹ then arrives she still gets announced.
+const KNOWN_ALERT_COOLDOWN_MS = parseInt(process.env.KNOWN_ALERT_COOLDOWN_MS || '300000', 10);
+
+/**
+ * Replace raw analyzer faces (which carry 128-d embeddings) with identity-
+ * annotated ones, tag the result, and broadcast a rate-limited stranger alert.
+ * No-op when no faces were found; never lets embeddings reach the DB.
+ */
+async function processFaces(cameraId, state, camera, result) {
+  const rawFaces = result?.analysis?.faces;
+  if (!rawFaces || rawFaces.length === 0) return;
+  try {
+    const { annotateFaces } = require('./faceMatch');
+    const { faces, hasStranger, knownNames, enrolled } = await annotateFaces(rawFaces);
+    result.analysis.faces = faces;
+    if (!enrolled) return; // nobody enrolled yet — everyone would be a "stranger"
+
+    const now = Date.now();
+    const { broadcast } = require('./sse');
+
+    // Two deliberately different signals: a recognised face is a low-key
+    // "who just arrived" notice, an unrecognised one is a warning.
+    if (knownNames.length > 0) {
+      result.tags = mergeTags(result.tags || [], ['known-person']);
+      state.lastKnownAlertAt = state.lastKnownAlertAt || {};
+      const fresh = knownNames.filter(
+        (n) => !state.lastKnownAlertAt[n] || now - state.lastKnownAlertAt[n] >= KNOWN_ALERT_COOLDOWN_MS
+      );
+      if (fresh.length > 0) {
+        fresh.forEach((n) => { state.lastKnownAlertAt[n] = now; });
+        broadcast('known-person-alert', {
+          cameraId: String(cameraId),
+          cameraName: camera.name,
+          at: new Date(),
+          names: fresh,
+        });
+        console.log(`[watcher] [${cameraId}] known person: ${fresh.join(', ')} on ${camera.name}`);
+      }
+    }
+
+    if (hasStranger) {
+      result.tags = mergeTags(result.tags || [], ['stranger']);
+      if (!state.lastStrangerAlertAt || now - state.lastStrangerAlertAt >= STRANGER_ALERT_COOLDOWN_MS) {
+        state.lastStrangerAlertAt = now;
+        const strangerCount = faces.filter((f) => f.isStranger).length;
+        broadcast('stranger-alert', {
+          cameraId: String(cameraId),
+          cameraName: camera.name,
+          at: new Date(),
+          strangerCount,
+          knownNames,
+        });
+        console.log(`[watcher] [${cameraId}] STRANGER alert: ${strangerCount} unknown face(s) on ${camera.name}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[watcher] [${cameraId}] face match failed: ${err.message}`);
+    // Strip raw embeddings so they never get persisted on the event.
+    result.analysis.faces = [];
+  }
+}
+
 // ── EZVIZ unified watch cycle — capture + analyze + record in one loop ────
 
 async function ezvizWatchCycle(cameraId) {
@@ -918,10 +1002,12 @@ async function ezvizWatchCycle(cameraId) {
     // Try RTSP direct first (auto-skipped if cached failure)
     let frameBuf = await captureRtspFrame(camera, 2000);
 
-    // Fallback to HLS/cloud
+    // Fallback to HLS/cloud. useCacheOnFail:false — never analyze a stale cached
+    // frame: doing so produced phantom "detections" from a previous day's image.
+    // If no fresh frame is available we skip this cycle instead.
     if (!frameBuf) {
       frameBuf = await captureOneFrame(camera, {
-        useCacheOnFail: true,
+        useCacheOnFail: false,
         fastMode: true,
         cloudTimeoutMs: 2000,
         hlsTimeoutMs: 2000,
@@ -954,7 +1040,7 @@ async function ezvizWatchCycle(cameraId) {
     await fsp.writeFile(tmpPath, frameBuf);
     let result;
     try {
-      result = await analyzeImage(tmpPath, { skipPlate: true });
+      result = await analyzeImage(tmpPath, { skipPlate: true, faces: true });
     } catch (analyzeErr) {
       console.warn(`[watcher] [${cameraId}] EZVIZ cycle #${cycleNum} analyze failed: ${analyzeErr.message}`);
       scheduleEzvizCycle(cameraId, state, COOLDOWN_MS);
@@ -962,6 +1048,8 @@ async function ezvizWatchCycle(cameraId) {
     } finally {
       try { await fsp.unlink(tmpPath); } catch (_) {}
     }
+
+    await processFaces(cameraId, state, camera, result);
 
     const detections = detectionTags(result, camera);
     console.log(`[watcher] [${cameraId}] EZVIZ cycle #${cycleNum} — detections: ${detections.join(',') || 'none'} (recording: ${state.isRecording})`);
@@ -1007,31 +1095,37 @@ async function ezvizWatchCycle(cameraId) {
     } else {
       // Not recording — check if should start
       if (detections.length > 0) {
-        console.log(`[watcher] [${cameraId}] Detection found — starting recording + saving snapshot`);
-        const preFrames = state.ringBuffer.getRecent(CLIP_BEFORE_SEC);
+        if (!RECORD_ON_DETECTION) {
+          // Presence-triggered video recording is disabled — save a snapshot
+          // event only, never start a clip recording.
+          await saveSnapshotEvent(cameraId, state, camera, frameBuf, result);
+        } else {
+          console.log(`[watcher] [${cameraId}] Detection found — starting recording + saving snapshot`);
+          const preFrames = state.ringBuffer.getRecent(CLIP_BEFORE_SEC);
 
-        state.isRecording = true;
-        state.recordingStart = new Date();
-        state.recordingStartTs = performance.now();
-        state.lastDetectionAt = performance.now();
-        state.pendingFrames = [...preFrames, entry];
-        state.pendingTags = [...detections];
-        state.recordedTags = [];
-        state.lastAnalysis = result.analysis || {};
-        state.consecutiveNoDetectionCycles = 0;
+          state.isRecording = true;
+          state.recordingStart = new Date();
+          state.recordingStartTs = performance.now();
+          state.lastDetectionAt = performance.now();
+          state.pendingFrames = [...preFrames, entry];
+          state.pendingTags = [...detections];
+          state.recordedTags = [];
+          state.lastAnalysis = result.analysis || {};
+          state.consecutiveNoDetectionCycles = 0;
 
-        if (isEzvizSerialAddress(camera.ipAddress)) {
-          startRtspRecording(cameraId, state, camera).catch((err) => {
-            console.warn(`[watcher] [${cameraId}] RTSP recording start failed: ${err.message}`);
-          });
+          if (isEzvizSerialAddress(camera.ipAddress)) {
+            startRtspRecording(cameraId, state, camera).catch((err) => {
+              console.warn(`[watcher] [${cameraId}] RTSP recording start failed: ${err.message}`);
+            });
+          }
+
+          sendRecordingStart(String(cameraId), { cameraName: camera.name, tags: detections });
+          await saveSnapshotEvent(cameraId, state, camera, frameBuf, result);
+
+          // Schedule next cycle quickly to keep tracking
+          scheduleEzvizCycle(cameraId, state, 1000);
+          return;
         }
-
-        sendRecordingStart(String(cameraId), { cameraName: camera.name, tags: detections });
-        await saveSnapshotEvent(cameraId, state, camera, frameBuf, result);
-
-        // Schedule next cycle quickly to keep tracking
-        scheduleEzvizCycle(cameraId, state, 1000);
-        return;
       }
     }
   } catch (err) {
@@ -1065,8 +1159,10 @@ async function unifiedWatchCycle(cameraId) {
 
   try {
     const captureStart = Date.now();
+    // useCacheOnFail:false — analysis must run on a fresh frame only, never a
+    // stale cached one (which caused phantom detections from an earlier day).
     const frameBuf = await captureOneFrame(camera, {
-      useCacheOnFail: true,
+      useCacheOnFail: false,
       fastMode: false,
     });
     const captureMs = Date.now() - captureStart;
@@ -1094,7 +1190,7 @@ async function unifiedWatchCycle(cameraId) {
     await fsp.writeFile(tmpPath, frameBuf);
     let result;
     try {
-      result = await analyzeImage(tmpPath, { skipPlate: true });
+      result = await analyzeImage(tmpPath, { skipPlate: true, faces: true });
     } catch (analyzeErr) {
       console.warn(`[watcher] [${cameraId}] Cycle #${cycleNum} analyze failed: ${analyzeErr.message}`);
       scheduleUnifiedCycle(cameraId, state, COOLDOWN_MS);
@@ -1102,6 +1198,8 @@ async function unifiedWatchCycle(cameraId) {
     } finally {
       try { await fsp.unlink(tmpPath); } catch (_) {}
     }
+
+    await processFaces(cameraId, state, camera, result);
 
     const detections = detectionTags(result, camera);
 
@@ -1155,6 +1253,13 @@ async function unifiedWatchCycle(cameraId) {
     }
 
     if (detections.length > 0) {
+      if (!RECORD_ON_DETECTION) {
+        // Presence-triggered video recording is disabled — save a snapshot
+        // event only, never start a clip recording.
+        await saveSnapshotEvent(cameraId, state, camera, frameBuf, result);
+        scheduleUnifiedCycle(cameraId, state, COOLDOWN_MS);
+        return;
+      }
       console.log(`[watcher] [${cameraId}] Detection found — starting recording`);
       const preFrames = state.ringBuffer.getRecent(CLIP_BEFORE_SEC);
 

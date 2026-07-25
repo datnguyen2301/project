@@ -149,29 +149,52 @@ def _is_real_pic_url(url):
     return True
 
 
-def _last_alarm_image_url(client, serial, fast=False):
-    """Scan recent cloud alarms for a real thumbnail; fallback to EzvizCamera.status."""
-    if fast:
-        data = client.get_alarminfo(serial, limit=5)
+def _alarm_time_ms(alarm):
+    """Best-effort extraction of an alarm's capture time as epoch milliseconds.
+
+    Different EZVIZ regions/devices use different field names/formats; try the
+    common numeric epoch fields first, then a "YYYY-MM-DD HH:MM:SS" string.
+    Returns None if no time can be parsed.
+    """
+    for k in ("alarmStartTime", "alarmTime", "startTime", "createTime", "sysTime"):
+        v = alarm.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v if v > 1e12 else v * 1000)
+        if isinstance(v, str) and v.isdigit():
+            n = int(v)
+            return n if n > 1e12 else n * 1000
+    import datetime
+    for k in ("alarmStartTimeStr", "alarmTimeStr", "startTimeStr"):
+        s = alarm.get(k)
+        if s:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    return int(datetime.datetime.strptime(str(s)[:19], fmt).timestamp() * 1000)
+                except Exception:
+                    pass
+    return None
+
+
+def _last_alarm_pic_and_time(client, serial, fast=False):
+    """Scan recent cloud alarms for a real thumbnail; fallback to EzvizCamera.status.
+
+    Returns (picUrl, picTimeMs). picTimeMs is None when unknown (e.g. the status
+    fallback), which callers should treat as "not fresh".
+    """
+    limits = (5,) if fast else (40, 15, 5)
+    for limit in limits:
+        data = client.get_alarminfo(serial, limit=limit)
         alarms = data.get("alarms") or []
         for alarm in alarms:
             pic = _pic_from_alarm(alarm)
             if _is_real_pic_url(pic):
-                return pic
-    else:
-        for limit in (40, 15, 5):
-            data = client.get_alarminfo(serial, limit=limit)
-            alarms = data.get("alarms") or []
-            for alarm in alarms:
-                pic = _pic_from_alarm(alarm)
-                if _is_real_pic_url(pic):
-                    return pic
+                return pic, _alarm_time_ms(alarm)
 
     cam = EzvizCamera(client, serial)
     st = cam.status()
     pic = st.get("last_alarm_pic") or ""
     if _is_real_pic_url(pic):
-        return pic
+        return pic, None
 
     raise ValueError(
         "EZVIZ không có ảnh cloud hợp lệ. Cần camera cùng LAN: bật RTSP, điền Verify Code "
@@ -180,12 +203,15 @@ def _last_alarm_image_url(client, serial, fast=False):
 
 
 def cmd_capture(client, args):
-    """Resolve last cloud image URL for camera (alarm snapshot, not true RTSP live)."""
+    """Resolve last cloud image URL for camera (alarm snapshot, not true RTSP live).
+
+    Also returns picTime (epoch ms) so callers can reject a stale alarm image.
+    """
     serial = args.get("serial", "")
     if not serial:
         raise ValueError("serial is required")
-    url = _last_alarm_image_url(client, serial, fast=args.get("fast", False))
-    return {"serial": serial, "picUrl": url}
+    url, pic_time = _last_alarm_pic_and_time(client, serial, fast=args.get("fast", False))
+    return {"serial": serial, "picUrl": url, "picTime": pic_time}
 
 
 def cmd_rtsp_info(client, args):

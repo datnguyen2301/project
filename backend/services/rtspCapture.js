@@ -362,7 +362,9 @@ async function captureRtspJpegToFile(camera, destPath, opts = {}) {
   return false;
 }
 
-async function captureFromHlsSegment(cameraId, destPath, timeoutMs = 8000) {
+const HLS_MAX_SEGMENT_AGE_MS = parseInt(process.env.WATCH_HLS_MAX_AGE_MS || '20000', 10);
+
+async function captureFromHlsSegment(cameraId, destPath, timeoutMs = 8000, maxAgeMs = HLS_MAX_SEGMENT_AGE_MS) {
   const { spawn } = require('child_process');
   const ffmpegBin = getFfmpegPath();
   const outDir = path.join(STREAMS_DIR, cameraId);
@@ -384,6 +386,20 @@ async function captureFromHlsSegment(cameraId, destPath, timeoutMs = 8000) {
     // Pick the most recent .ts segment (sorted by name, which is seg_XXX.ts with increasing numbers)
     const latestTs = tsFiles.sort().at(-1);
     const tsPath = path.join(outDir, latestTs);
+
+    // Freshness guard: a leftover segment from a previous session/day would make
+    // the watcher "detect" whoever was in frame back then. Refuse anything older
+    // than maxAgeMs so analysis only ever runs on a live segment.
+    try {
+      const ageMs = Date.now() - fs.statSync(tsPath).mtimeMs;
+      if (ageMs > maxAgeMs) {
+        resolve({ ok: false, stderr: `stale_segment_${Math.round(ageMs / 1000)}s` });
+        return;
+      }
+    } catch (_) {
+      resolve({ ok: false, stderr: 'segment_stat_failed' });
+      return;
+    }
 
     // Also check the m3u8 to know which .ts is the "current" one being written
     try {

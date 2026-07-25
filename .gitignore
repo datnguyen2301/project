@@ -16,9 +16,13 @@ __pycache__/
 *.pyc
 *.pyo
 
-# YOLO models (lớn, có thể tự tải)
+# Model weights — large, and all of them are downloadable (see README).
+# Keeping them out of git also avoids redistributing third-party weights whose
+# licence does not permit it (the licence plate models have none).
 backend/models/yolov8*.pt
 backend/yolov8*.pt
+backend/models/LP_*.pt
+backend/models/*.onnx
 
 # HLS streams
 backend/streams/

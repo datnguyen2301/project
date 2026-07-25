@@ -79,7 +79,7 @@ d:\project\
 | Backend | Node.js, Express 5, Mongoose (MongoDB ODM) |
 | Database | MongoDB (local, db name: `camera_surveillance`) |
 | File handling | Multer (upload), Sharp (thumbnail), uuid (filename) |
-| AI/ML | Python, Ultralytics YOLOv8 (`yolov8n.pt`), EasyOCR |
+| AI/ML | Python, Ultralytics YOLOv8 (`yolov8n.pt`) for person/vehicle detection; two-stage YOLOv5 for Vietnamese license plates |
 | Camera integration | pyezviz (EZVIZ), IP Webcam (Android app, MJPEG), RTSP |
 | Streaming | FFmpeg (RTSP to HLS/HTTP-GIF) |
 | Authentication | JWT (jsonwebtoken), bcrypt |
@@ -93,9 +93,13 @@ d:\project\
 ### 2. Auto-Watch (AI Detection)
 - Background watcher captures every 5 seconds
 - Sends frames to Python YOLO server for analysis
-- Saves event when person/vehicle is detected
+- Saves a snapshot event when a person/vehicle is detected
 - 15-second cooldown after each save to avoid duplicates
 - Watcher state is persisted and restored on server restart
+- **Presence-triggered video recording is disabled by default.** On a detection
+  the watcher saves a snapshot only; it no longer auto-records a video clip while
+  someone is present. Set `WATCH_RECORD_ON_DETECTION=true` to re-enable it. (This
+  is independent of the 24/7 continuous recorder, controlled by `autoRecord`.)
 
 ### 3. Event Management
 - Full event history with filtering by camera, date range, tag, license plate
@@ -139,6 +143,31 @@ and desyncs the packet parser otherwise.
 > Caveats: the upstream project is beta and reverse-engineered, and the camera's
 > **Image Encryption must be off** (E2EE is not implemented yet).
 
+### 4c. Face Recognition & Stranger Alerts
+
+- Enroll known people on the **Khuôn mặt** page (name + clear frontal photo; the
+  same name can be enrolled multiple times for more angles).
+- During auto-watch, every frame with a person also runs face extraction
+  (YuNet detector + SFace 128-d embeddings — both ship with OpenCV, models in
+  `backend/models/*.onnx`).
+- Node matches embeddings against enrolled persons (cosine ≥ `FACE_MATCH_THRESHOLD`,
+  default 0.45). The two outcomes are signalled differently on purpose:
+
+  | | Recognised face | Unrecognised face |
+  |---|---|---|
+  | Event tag | `known-person` (+ the name) | `stranger` |
+  | SSE event | `known-person-alert` | `stranger-alert` |
+  | Notification | green, 4s, "✓ Người quen: Bố" | red, 12s, "⚠ NGƯỜI LẠ" |
+  | Box on image | solid green, labelled with the name | thick **dashed red**, "NGƯỜI LẠ" |
+  | Rate limit | per person, 5 min | per camera, 1 min |
+- No alerts fire until at least one person is enrolled, and faces under
+  `FACE_MIN_PX` (60px) are ignored rather than mislabeled — measured testing showed
+  small faces are the dominant cause of wrong identity matches.
+- **The subject must be reasonably close to the camera.** Distant figures are
+  reported as a plain `person` detection with no identity claim, rather than being
+  guessed at. Measured on a 27-person group photo, this configuration re-identified
+  98% of known faces with zero strangers matched as known.
+
 ### 5. Authentication
 - JWT-based user authentication
 - Role-based access (user registration/login)
@@ -180,12 +209,23 @@ and desyncs the packet parser otherwise.
  → Stream back as multipart/x-mixed-replace
 ```
 
-### License Plate Recognition
+### License Plate Recognition (Vietnamese)
 ```
-[Event image] → analyze_server.py (YOLOv8)
- → Detected plate region → plate_reader.py (EasyOCR)
- → Extracted text → saved to Event.tags (plate: "29A12345")
+[Event image] → analyze_server.py
+ → plate_reader.py — two-stage YOLOv5:
+     Stage 1  LP_detector  → locate plate rectangle(s)
+     Stage 2  LP_ocr       → detect each character as an object,
+                             order into 1-row / 2-row plate
+ → licensePlates saved to Event.analysis (e.g. "30G-70516"), tag: "plate"
 ```
+
+Handles both 1-row (car) and 2-row (motorbike) Vietnamese plates. Runs ~0.1–0.9s
+per plate on CPU using the nano weights. Models & method adapted from
+[trungdinh22/License-Plate-Recognition](https://github.com/trungdinh22/License-Plate-Recognition).
+
+> **License note:** the upstream plate-recognition repo publishes no license file.
+> Its weights/method are vendored here at the project owner's discretion; review its
+> terms before any redistribution or commercial use.
 
 ## Environment Variables
 
@@ -196,6 +236,32 @@ PORT=5000
 MONGO_URI=mongodb://localhost:27017/camera_surveillance
 ANALYZER_PORT=5100
 PYTHON_PATH=python
+
+# AI analyzer CPU tuning (all optional — defaults tuned for low CPU)
+YOLO_MODEL=yolov8s.pt              # default; use yolov8n.pt for less CPU (lower recall)
+YOLO_IMGSZ=640                     # inference resolution; lower (e.g. 512) = less CPU, weaker recall
+ANALYZER_WORKERS=2                 # parallel YOLO worker processes
+ANALYZER_THREADS_PER_WORKER=4      # torch/BLAS threads per worker; keep
+                                  # WORKERS * THREADS_PER_WORKER <= CPU cores
+
+# Face recognition / stranger alerts (YuNet + SFace, bundled with OpenCV) — optional
+# FACE_MATCH_THRESHOLD=0.45         # SFace cosine similarity for "same person".
+#                                   # Higher = fewer strangers slipping through as
+#                                   # known, more false "stranger" alerts.
+# FACE_MIN_PX=60                    # ignore faces smaller than this (measured on
+#                                   # the downscaled frame). Small faces are the
+#                                   # main cause of wrong identity matches.
+# STRANGER_ALERT_COOLDOWN_MS=60000  # min gap between stranger alerts per camera
+# KNOWN_ALERT_COOLDOWN_MS=300000    # min gap between "known person" notices, per
+#                                   # person — routine arrivals shouldn't spam
+
+# Vietnamese license plate recognition (two-stage YOLOv5) — all optional
+# LPR_DETECTOR_WEIGHTS=models/LP_detector_nano_61.pt  # or LP_detector.pt (~41MB, more accurate)
+# LPR_OCR_WEIGHTS=models/LP_ocr_nano_62.pt            # or LP_ocr.pt (~41MB)
+# LPR_DETECT_CONF=0.60              # plate-detection confidence threshold
+# LPR_OCR_CONF=0.60                 # character-detection confidence threshold
+# YOLOV5_DIR=                       # path to a local yolov5 clone (offline mode)
+# PLATE_TIMEOUT_SEC=25              # max seconds for one plate read
 
 # IP Webcam (optional)
 IP_WEBCAM_URL=http://192.168.1.xxx:xxxx
@@ -215,6 +281,10 @@ EZVIZ_REGION=apiisgp
 
 # Optional
 RESTORE_AUTOWATCH_ON_START=true
+
+# Auto-record a video clip while a person/vehicle is present (default: false).
+# When false, auto-watch saves detection snapshots but records no video clip.
+WATCH_RECORD_ON_DETECTION=false
 ```
 
 ## Installation
@@ -248,12 +318,31 @@ npm install
 
 # 5. Install Python dependencies (in backend directory)
 cd ../backend
-pip install ultralytics easyocr pillow requests pyezviz
+# ultralytics (YOLOv8) + the deps YOLOv5 needs for plate recognition
+pip install ultralytics pillow requests pyezviz pandas tqdm seaborn psutil gitpython
 
-# 6. (Optional) Download YOLO model manually
-# The model yolov8n.pt auto-downloads on first run via analyze_server.py
-# You can pre-download:
-# python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+# 6. Model weights — NOT in git (large, and third-party licences vary).
+#    Download them into backend/models/ before first run.
+
+# 6a. Person/vehicle detection — auto-downloads on first run, or pre-fetch:
+python -c "from ultralytics import YOLO; YOLO('yolov8s.pt')"
+
+# 6b. Face recognition (YuNet + SFace, Apache-2.0, from OpenCV Zoo)
+curl -L -o models/face_detection_yunet_2023mar.onnx \
+  https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+curl -L -o models/face_recognition_sface_2021dec.onnx \
+  https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+
+# 6c. Vietnamese licence plate weights, from
+#     https://github.com/trungdinh22/License-Plate-Recognition
+#     Download LP_detector_nano_61.pt and LP_ocr_nano_62.pt from that repo's
+#     ./model folder into backend/models/.
+#     NOTE: that project publishes no licence file, so its weights are not
+#     redistributed here — fetch them yourself and review its terms.
+#
+#     The YOLOv5 code is fetched via torch.hub on first plate read (needs
+#     internet once; cached afterwards). To run fully offline, clone
+#     https://github.com/ultralytics/yolov5 and set YOLOV5_DIR to its path.
 ```
 
 ## Running the System

@@ -2,6 +2,8 @@ const COLORS = {
   person: '#22c55e',
   vehicle: '#3b82f6',
   plate: '#f59e0b',
+  knownFace: '#16a34a',
+  stranger: '#dc2626',
 };
 
 export default function AnalysisOverlay({ analysis, imgWidth, imgHeight, naturalWidth, naturalHeight }) {
@@ -21,6 +23,20 @@ export default function AnalysisOverlay({ analysis, imgWidth, imgHeight, natural
   (analysis.licensePlates || []).forEach((lp, i) => {
     boxes.push({ ...lp.bbox, label: lp.plateNumber, color: COLORS.plate, key: `lp${i}` });
   });
+  // Faces are drawn last so they sit on top of the person box that contains them.
+  // A stranger gets a thicker, dashed red box so it reads as an alert at a glance,
+  // while a recognised face is a calm solid green box carrying the person's name.
+  (analysis.faces || []).forEach((f, i) => {
+    if (!f.bbox) return;
+    boxes.push({
+      ...f.bbox,
+      label: f.isStranger ? 'NGƯỜI LẠ' : (f.name || 'Khuôn mặt'),
+      color: f.isStranger ? COLORS.stranger : COLORS.knownFace,
+      strokeWidth: f.isStranger ? 4 : 2,
+      dashed: f.isStranger,
+      key: `f${i}`,
+    });
+  });
 
   return (
     <svg
@@ -38,7 +54,8 @@ export default function AnalysisOverlay({ analysis, imgWidth, imgHeight, natural
             height={b.height * scaleY}
             fill="none"
             stroke={b.color}
-            strokeWidth={2}
+            strokeWidth={b.strokeWidth || 2}
+            strokeDasharray={b.dashed ? '7 4' : undefined}
           />
           <rect
             x={b.x * scaleX}

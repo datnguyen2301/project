@@ -1,448 +1,267 @@
 """
-License Plate Detection — surveillance-optimized using EasyOCR + shape detection.
+Vietnamese License Plate Detection & Recognition.
+
+Two-stage YOLOv5 pipeline (adapted from trungdinh22/License-Plate-Recognition):
+  Stage 1  LP_detector  — locate the plate rectangle(s) in the frame.
+  Stage 2  LP_ocr       — detect each CHARACTER as an object inside the crop, then
+                          order them geometrically into 1-row or 2-row plates.
+
+This replaces the previous EasyOCR pipeline. Character-detection is markedly more
+accurate on Vietnamese plates (especially 2-row motorbike plates) than generic OCR.
+
+Interface is unchanged so the analyzer needs no edits:
+  read_plate(image_path, vehicle_bboxes=None) -> [{plateNumber, confidence, bbox}]
+  _get_reader()  -> pre-loads both models (used by the analyzer to warm up)
+
+Setup notes:
+  - Weights (nano, ~4MB each) live in backend/models/:
+        LP_detector_nano_61.pt, LP_ocr_nano_62.pt
+    Override with LPR_DETECTOR_WEIGHTS / LPR_OCR_WEIGHTS. Full-size weights
+    (LP_detector.pt / LP_ocr.pt, ~41MB) are more accurate if you add them.
+  - YOLOv5 is loaded via torch.hub. On first run it downloads the yolov5 repo to
+    the torch hub cache (needs internet once). To run fully offline, clone
+    https://github.com/ultralytics/yolov5 and set YOLOV5_DIR to its path.
+
+Attribution: models & method from https://github.com/trungdinh22/License-Plate-Recognition
 """
 
+import math
 import os
-import re
-import numpy as np
-import cv2
-import easyocr
 
-# Timeout for entire plate detection (seconds)
+import cv2
+import numpy as np
+
+# Kept for backwards-compat; the analyzer bounds each read with its own timeout.
 PLATE_TIMEOUT_SEC = 15
 
-# Lazy singleton: initialize EasyOCR once per process (GPU/CPU auto-detected)
-_easyocr_reader = None
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'models')
+
+DETECTOR_WEIGHTS = os.environ.get(
+    'LPR_DETECTOR_WEIGHTS', os.path.join(_MODELS_DIR, 'LP_detector_nano_61.pt'))
+OCR_WEIGHTS = os.environ.get(
+    'LPR_OCR_WEIGHTS', os.path.join(_MODELS_DIR, 'LP_ocr_nano_62.pt'))
+
+DETECT_SIZE = int(os.environ.get('LPR_DETECT_SIZE', '640'))
+DETECT_CONF = float(os.environ.get('LPR_DETECT_CONF', '0.60'))
+OCR_CONF = float(os.environ.get('LPR_OCR_CONF', '0.60'))
+
+# Lazy singletons — loaded once per process.
+_lp_detect = None
+_lp_ocr = None
+
+
+def _load_yolov5(weights_path):
+    """Load a YOLOv5 'custom' model from local weights via torch.hub."""
+    import torch
+    yolov5_dir = os.environ.get('YOLOV5_DIR', '').strip()
+    if yolov5_dir and os.path.isdir(yolov5_dir):
+        return torch.hub.load(yolov5_dir, 'custom', path=weights_path,
+                              source='local', force_reload=False)
+    # Fall back to fetching the yolov5 repo from GitHub (cached after first run).
+    # trust_repo=True avoids torch.hub's interactive trust prompt (fatal on a server).
+    return torch.hub.load('ultralytics/yolov5', 'custom', path=weights_path,
+                          source='github', force_reload=False, trust_repo=True)
+
+
+def _load_models():
+    """Load and cache both YOLOv5 models. Returns (detector, ocr) or (None, None)."""
+    global _lp_detect, _lp_ocr
+    if _lp_detect is not None and _lp_ocr is not None:
+        return _lp_detect, _lp_ocr
+    for w in (DETECTOR_WEIGHTS, OCR_WEIGHTS):
+        if not os.path.exists(w):
+            print(f"[plate_reader] Missing weights: {w} — plate detection disabled", flush=True)
+            return None, None
+    try:
+        _lp_detect = _load_yolov5(DETECTOR_WEIGHTS)
+        _lp_detect.conf = DETECT_CONF
+        _lp_ocr = _load_yolov5(OCR_WEIGHTS)
+        _lp_ocr.conf = OCR_CONF
+        print(f"[plate_reader] Loaded LPR models "
+              f"(detector={os.path.basename(DETECTOR_WEIGHTS)}, "
+              f"ocr={os.path.basename(OCR_WEIGHTS)})", flush=True)
+    except Exception as e:
+        print(f"[plate_reader] Failed to load YOLOv5 LPR models: {e}", flush=True)
+        _lp_detect, _lp_ocr = None, None
+    return _lp_detect, _lp_ocr
 
 
 def _get_reader():
-    """Get or create the EasyOCR reader (lazy singleton)."""
-    global _easyocr_reader
-    if _easyocr_reader is None:
-        _easyocr_reader = easyocr.Reader(['en'], gpu=True, verbose=False)
-    return _easyocr_reader
+    """Compat shim for the analyzer's warm-up call — ensures models are loaded."""
+    _load_models()
+    return _lp_detect
 
 
-def _normalize(raw):
-    """
-    Parse OCR text into VN plate: N[N]-L[LL]-NNNNN.
-    """
-    if not raw:
-        return None
-    c = raw.upper()
-    c = re.sub(r'[\n\r\|]+', ' ', c)
-    c = re.sub(r'[^A-Z0-9.\- ]', ' ', c)
-    c = re.sub(r'\s+', ' ', c).strip()
-    if not c:
-        return None
+# ── Deskew helpers (vendored from utils_rotate.py) ────────────────────────────
 
-    def _build(province, district, serial):
-        prov = re.sub(r'[^0-9]', '', province)
-        ser = re.sub(r'[^0-9]', '', serial)
-        if not re.match(r'^\d{1,2}$', prov):
-            return None
-        if not re.match(r'^\d{4,7}$', ser):
-            return None
-        d = district.upper()
-        # Valid Vietnamese district letters (excludes F and Q)
-        if not re.match(r'^[ABEKHMNPRSTUVXZY]+$', d):
-            return None
-        if len(ser) > 5:
-            ser = ser[:5]
-        return f"{prov}{d}-{ser}"
-
-    # Strategy 1: regex find (handles noise between parts)
-    for m in re.finditer(
-            r'(?<![A-Z0-9])(\d{1,2})[.\- ]*([A-Z0-9]{1,3})[.\- ]*(\d{4,7})(?![A-Z0-9])',
-            c, re.IGNORECASE):
-        p = _build(m.group(1), m.group(2), m.group(3))
-        if p:
-            return p
-
-    # Strategy 2: strip → try boundaries
-    clean = re.sub(r'[^A-Z0-9]', '', c)
-    if 7 <= len(clean) <= 15:
-        has_l = bool(re.search(r'[A-Z]', clean))
-        has_d = bool(re.search(r'[0-9]', clean))
-        if has_l and has_d:
-            for pl in [2, 1]:
-                if len(clean) < pl + 3:
-                    continue
-                prov = clean[:pl]
-                if not re.match(r'^\d+$', prov):
-                    continue
-                rem = clean[pl:]
-                for dl in range(1, 4):
-                    if len(rem) < dl + 4:
-                        continue
-                    dist = rem[:dl]
-                    ser = rem[dl:]
-                    if re.match(r'^[A-Z]', dist) and re.match(r'^\d{4,7}$', ser):
-                        p = _build(prov, dist, ser)
-                        if p:
-                            return p
-                    if re.match(r'^[0O]$', dist) and re.match(r'^[A-Z]{1,2}\d{4,}$', ser):
-                        for adl in [1, 2]:
-                            ad = ser[:adl]
-                            asr = ser[adl:]
-                            if re.match(r'^[A-Z]$', ad) and re.match(r'^\d{4,}$', asr):
-                                p = _build(prov, 'O' + ad, asr)
-                                if p:
-                                    return p
-
-    # Strategy 3: aggressive split for OCR fragments e.g. "29A-3356" or "29A33562"
-    m3 = re.search(r'^(\d{1,2})([A-Z]{1,3})(\d{3,7})$', clean)
-    if m3:
-        p = _build(m3.group(1), m3.group(2), m3.group(3))
-        if p:
-            return p
-
-    # Strategy 4: just province + serial with minimal district placeholder
-    m4 = re.search(r'(\d{1,2})(\d{4,7})$', clean)
-    if m4:
-        p = _build(m4.group(1), 'X', m4.group(2))
-        if p:
-            return p
-
-    # Strategy 5: handle digit-within-plate like "15,13,56" -> "151356"
-    m5 = re.search(r'^(\d{1,2})[,.](\d{1,2})[,.](\d{2,5})$', clean)
-    if m5:
-        prov, mid, ser = m5.group(1), m5.group(2), m5.group(3)
-        if len(mid) >= 1 and len(ser) <= 5:
-            for dl in [1, 2]:
-                if len(mid) < dl:
-                    continue
-                dist = mid[:dl]
-                ser_full = mid[dl:] + ser
-                if re.match(r'^\d{4,7}$', ser_full):
-                    p = _build(prov, dist, ser_full)
-                    if p:
-                        return p
-
-    return None
+def _change_contrast(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_channel, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l_channel)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
 
-def _is_plate_aspect(w, h):
-    """Check if region has VN plate aspect ratio (3:1 to 5:1 wide-to-tall)."""
-    if h <= 0 or w <= 0:
-        return False
-    ratio = w / float(h)
-    return 2.5 <= ratio <= 6.0
+def _rotate_image(image, angle):
+    center = tuple(np.array(image.shape[1::-1]) / 2)
+    rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(image, rot_mat, image.shape[1::-1], flags=cv2.INTER_LINEAR)
 
 
-def _detect_plate_candidates(img):
-    """
-    Detect rectangular regions likely to be license plates using edge detection.
-    Returns list of (x, y, width, height) in image pixel coords.
-    """
-    ih, iw = img.shape[:2]
-
-    # Convert to grayscale
-    if len(img.shape) == 3 and img.shape[2] >= 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def _compute_skew(src_img, center_thres):
+    if len(src_img.shape) == 3:
+        h, w, _ = src_img.shape
+    elif len(src_img.shape) == 2:
+        h, w = src_img.shape
     else:
-        gray = img
-
-    # Bilateral filter to reduce noise while keeping edges
-    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
-
-    # Canny edge detection
-    edges = cv2.Canny(blurred, 50, 150)
-
-    # Dilate to connect edge fragments
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    dilated = cv2.dilate(edges, kernel, iterations=2)
-
-    # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-
-        # Filter by size
-        if w < 40 or h < 10:
-            continue
-        if w > iw * 0.95 or h > ih * 0.5:
-            continue
-
-        # Filter by plate-like aspect ratio
-        if not _is_plate_aspect(w, h):
-            continue
-
-        candidates.append((x, y, w, h))
-
-    # Sort by area descending, take top 5
-    candidates.sort(key=lambda r: r[2] * r[3], reverse=True)
-    return candidates[:5]
-
-
-def _ocr_crop(crop, min_confidence=0.25):
-    """
-    Run EasyOCR on a cropped image. Returns (plate_text, confidence) or (None, 0).
-    Tries multiple preprocessing approaches and uses _normalize to validate results.
-    """
-    h, w = crop.shape[:2]
-    if h < 5 or w < 20:
-        return None, 0.0
-
-    ih, iw = h, w
-    reader = _get_reader()
-
-    best_plate, best_conf = None, 0.0
-
-    # Try multiple scales and preprocessing strategies
-    for scale in [3, 4, 2]:
-        try:
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.shape[2] >= 3 else crop
-            up = cv2.resize(gray, (max(int(iw * scale), 300), max(int(ih * scale), 60)),
-                            interpolation=cv2.INTER_LANCZOS4)
-            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(3, 2))
-            enhanced = clahe.apply(up)
-            color = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-
-            results = reader.readtext(color, batch_size=4)
-            for bbox, text, conf in results:
-                if conf < min_confidence:
-                    continue
-                text = text.strip()
-                if not text:
-                    continue
-                norm = _normalize(text)
-                if norm and conf >= best_conf:
-                    best_plate, best_conf = norm, conf
-        except Exception:
-            pass
-
-    # Strategy A: raw crop
-    try:
-        results = reader.readtext(crop, batch_size=4)
-        for bbox, text, conf in results:
-            if conf < min_confidence:
+        return 0.0
+    img = cv2.medianBlur(src_img, 3)
+    edges = cv2.Canny(img, threshold1=30, threshold2=100, apertureSize=3, L2gradient=True)
+    lines = cv2.HoughLinesP(edges, 1, math.pi / 180, 30, minLineLength=w / 1.5, maxLineGap=h / 3.0)
+    if lines is None:
+        return 1
+    min_line = 100
+    min_line_pos = 0
+    for i in range(len(lines)):
+        for x1, y1, x2, y2 in lines[i]:
+            center_point = [((x1 + x2) / 2), ((y1 + y2) / 2)]
+            if center_thres == 1 and center_point[1] < 7:
                 continue
-            text = text.strip()
-            if not text:
-                continue
-            norm = _normalize(text)
-            if norm and conf >= best_conf:
-                best_plate, best_conf = norm, conf
-    except Exception:
-        pass
-
-    # Strategy B: CLAHE upscale
-    if best_conf < 0.60:
-        try:
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.shape[2] >= 3 else crop
-            scale = 3
-            up = cv2.resize(gray, (max(int(iw * scale), 300), max(int(ih * scale), 60)),
-                            interpolation=cv2.INTER_LANCZOS4)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 2))
-            enhanced = clahe.apply(up)
-            color = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-            results2 = reader.readtext(color, batch_size=4)
-            for bbox, text, conf in results2:
-                if conf < min_confidence:
-                    continue
-                text = text.strip()
-                if not text:
-                    continue
-                norm = _normalize(text)
-                if norm and conf >= best_conf:
-                    best_plate, best_conf = norm, conf
-        except Exception:
-            pass
-
-    return best_plate, best_conf
+            if center_point[1] < min_line:
+                min_line = center_point[1]
+                min_line_pos = i
+    angle = 0.0
+    cnt = 0
+    for x1, y1, x2, y2 in lines[min_line_pos]:
+        ang = np.arctan2(y2 - y1, x2 - x1)
+        if math.fabs(ang) <= 30:  # exclude extreme rotations
+            angle += ang
+            cnt += 1
+    if cnt == 0:
+        return 0.0
+    return (angle / cnt) * 180 / math.pi
 
 
-def _validate_plate_sequence(crop, plate_text, reader):
-    """
-    Check if OCR text appears contiguously in the crop (plate-like layout).
-    Rejects scattered watermark text that happens to match a plate pattern.
-    Returns True if the detected text forms a horizontal line (plate behavior).
-    """
-    try:
-        h, w = crop.shape[:2]
-        if h < 5 or w < 20:
-            return True  # can't check, be permissive
+def _deskew(src_img, change_cons, center_thres):
+    if change_cons == 1:
+        return _rotate_image(src_img, _compute_skew(_change_contrast(src_img), center_thres))
+    return _rotate_image(src_img, _compute_skew(src_img, center_thres))
 
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.shape[2] >= 3 else crop
-        up = cv2.resize(gray, (max(w * 3, 300), max(h * 3, 60)), interpolation=cv2.INTER_LANCZOS4)
-        results = reader.readtext(up, batch_size=4)
 
-        # Find the detected text's bbox
-        for bbox, text, conf in results:
-            text = text.strip().upper()
-            if not text:
-                continue
-            # Check if this matches the detected plate
-            if _normalize(text) == plate_text or _normalize(text) == plate_text:
-                pts = np.array(bbox, dtype=np.int32)
-                xs = pts[:, 0]
-                # Plate text should form a roughly horizontal line
-                # Width of bbox should be significantly larger than height
-                bw = xs.max() - xs.min()
-                bh = pts[:, 1].max() - pts[:, 1].min()
-                if bh > 0:
-                    aspect = bw / float(bh)
-                    # Reject if text is very tall (likely watermark scattered text)
-                    if aspect < 2.0:
-                        return False
-                    return True
-        return True  # couldn't check, be permissive
-    except Exception:
-        return True
+# ── Character ordering (vendored from helper.py) ──────────────────────────────
 
+def _linear_equation(x1, y1, x2, y2):
+    b = y1 - (y2 - y1) * x1 / (x2 - x1)
+    a = (y1 - b) / x1
+    return a, b
+
+
+def _check_point_linear(x, y, x1, y1, x2, y2):
+    a, b = _linear_equation(x1, y1, x2, y2)
+    y_pred = a * x + b
+    return math.isclose(y_pred, y, abs_tol=3)
+
+
+def _read_plate_chars(ocr_model, im):
+    """Detect + order plate characters. Returns the plate string or 'unknown'."""
+    lp_type = "1"
+    results = ocr_model(im)
+    bb_list = results.pandas().xyxy[0].values.tolist()
+    # A valid VN plate has 7-10 characters.
+    if len(bb_list) == 0 or len(bb_list) < 7 or len(bb_list) > 10:
+        return "unknown"
+
+    center_list = []
+    y_sum = 0
+    for bb in bb_list:
+        x_c = (bb[0] + bb[2]) / 2
+        y_c = (bb[1] + bb[3]) / 2
+        y_sum += y_c
+        center_list.append([x_c, y_c, bb[-1]])  # bb[-1] = detected character (class name)
+
+    # Two extreme-x points define a baseline; a char far off it ⇒ 2-row plate.
+    l_point = center_list[0]
+    r_point = center_list[0]
+    for cp in center_list:
+        if cp[0] < l_point[0]:
+            l_point = cp
+        if cp[0] > r_point[0]:
+            r_point = cp
+    for ct in center_list:
+        if l_point[0] != r_point[0]:
+            if not _check_point_linear(ct[0], ct[1], l_point[0], l_point[1], r_point[0], r_point[1]):
+                lp_type = "2"
+
+    y_mean = int(int(y_sum) / len(bb_list))
+    license_plate = ""
+    if lp_type == "2":
+        line_1, line_2 = [], []
+        for c in center_list:
+            (line_2 if int(c[1]) > y_mean else line_1).append(c)
+        for l1 in sorted(line_1, key=lambda x: x[0]):
+            license_plate += str(l1[2])
+        license_plate += "-"
+        for l2 in sorted(line_2, key=lambda x: x[0]):
+            license_plate += str(l2[2])
+    else:
+        for l in sorted(center_list, key=lambda x: x[0]):
+            license_plate += str(l[2])
+    return license_plate
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
 
 def read_plate(image_path, vehicle_bboxes=None):
     """
-    Main entry point. Returns list of {plateNumber, confidence, bbox}.
-    Strategy:
-      1. Detect rectangular plate candidates via edge detection
-      2. OCR only those rectangular regions
-      3. Fallback: open-field scan in bottom-right if no candidates found
+    Return list of {plateNumber, confidence, bbox}.
+
+    `vehicle_bboxes` is accepted for interface compatibility but unused: the plate
+    detector runs on the full frame and localises plates directly.
     """
     if not os.path.exists(image_path):
         return []
     img = cv2.imread(image_path)
     if img is None:
         return []
-    if vehicle_bboxes is None:
-        vehicle_bboxes = []
 
-    if img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    detect, ocr = _load_models()
+    if detect is None or ocr is None:
+        return []
 
-    # Downscale very large images to speed up OCR (2880x1620 -> 960x540)
-    max_dim = 1920
-    ih, iw = img.shape[:2]
-    if max(ih, iw) > max_dim:
-        scale = max_dim / max(ih, iw)
-        img = cv2.resize(img, (int(iw * scale), int(ih * scale)), interpolation=cv2.INTER_AREA)
-        print(f"[plate_reader] Downscaled to {img.shape[1]}x{img.shape[0]}", flush=True)
     results = []
-    reader = _get_reader()
+    try:
+        det = detect(img, size=DETECT_SIZE)
+        plates = det.pandas().xyxy[0].values.tolist()
+    except Exception as e:
+        print(f"[plate_reader] detector error: {e}", flush=True)
+        return []
 
-    # 1. Shape detection: find plate-like rectangles
-    shape_candidates = _detect_plate_candidates(img)
-
-    if shape_candidates:
-        print(f"[plate_reader] Found {len(shape_candidates)} shape candidates: {[f'({x},{y},{w}x{h})' for x,y,w,h in shape_candidates]}", flush=True)
-
-        best_plate, best_conf = None, 0.0
-        best_bbox = None
-
-        for x, y, w, h in shape_candidates:
-            crop = img[y:y+h, x:x+w]
-            if crop.size == 0:
-                continue
-
-            plate, conf = _ocr_crop(crop)
-            if plate and conf > best_conf:
-                # Validate plate-like layout
-                if _validate_plate_sequence(crop, plate, reader):
-                    best_plate, best_conf = plate, conf
-                    best_bbox = {"x": x, "y": y, "width": w, "height": h}
-
-        if best_plate and best_conf > 0:
-            results.append({
-                "plateNumber": best_plate,
-                "confidence": round(min(best_conf, 0.95), 3),
-                "bbox": best_bbox,
-            })
-            return results
-
-    # 2. Fallback: open-field scan (right-bottom area)
-    # Wide scan to catch plates in various positions (handles tilted plates)
-    for start_pct in [0.65, 0.70, 0.75, 0.80, 0.60]:
-        start_y = int(ih * start_pct)
-        end_y = min(ih, start_y + int(ih * 0.20))
-        # Try right portion (70% of width) and full width
-        for x_start_pct in [0.30, 0.0]:
-            x_start = int(iw * x_start_pct)
-            crop = img[start_y:end_y, x_start:iw]
-            if crop.size == 0:
-                continue
-
-            plate, conf = _ocr_crop(crop)
-            if plate and conf >= 0.50:
-                # Validate layout — skip watermark text with tall aspect ratio
-                if not _validate_plate_sequence(crop, plate, reader):
-                    print(f"[plate_reader] Rejected watermark-like text: {plate}", flush=True)
-                    continue
-
-                plate_h = max(int((end_y - start_y) * 0.6), 10)
-                plate_w = max(int(iw * 0.5), 30)
-                px = int((iw - plate_w) // 2)
-                py = start_y
-                results.append({
-                    "plateNumber": plate,
-                    "confidence": round(min(conf, 0.95), 3),
-                    "bbox": {"x": px, "y": py, "width": plate_w, "height": plate_h},
-                })
-                return results
-
-    # 3. Per-vehicle scans (for when vehicle detection is accurate)
-    flat_bboxes = []
-    for vb in vehicle_bboxes:
-        if "x" in vb and "y" in vb:
-            flat_bboxes.append(vb)
-        elif "bbox" in vb and isinstance(vb["bbox"], dict):
-            flat_bboxes.append(vb["bbox"])
-
-    for vb in flat_bboxes:
-        x = int(vb.get("x", 0))
-        y = int(vb.get("y", 0))
-        vw = int(vb.get("width", 0))
-        vh = int(vb.get("height", 0))
-        x2 = min(iw, x + vw)
-        y2 = min(ih, y + vh)
-        x, y = max(0, x), max(0, y)
-        aw, ah = x2 - x, y2 - y
-        if aw <= 0 or ah <= 0:
+    for p in plates:
+        x1, y1, x2, y2 = int(p[0]), int(p[1]), int(p[2]), int(p[3])
+        conf = float(p[4])
+        crop = img[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+        if crop.size == 0:
             continue
 
-        best_plate, best_conf = None, 0.0
-        best_bbox = None
+        # Try up to 4 deskew variants; take the first valid read.
+        plate_text = "unknown"
+        for change_cons in range(2):
+            for center_thres in range(2):
+                try:
+                    plate_text = _read_plate_chars(ocr, _deskew(crop, change_cons, center_thres))
+                except Exception:
+                    plate_text = "unknown"
+                if plate_text and plate_text != "unknown":
+                    break
+            if plate_text and plate_text != "unknown":
+                break
 
-        # Scan bottom-right portion of vehicle where plate is located
-        for bfrac, hfrac in [
-            (0.60, 0.28),
-            (0.70, 0.25),
-            (0.78, 0.22),
-            (0.85, 0.18),
-        ]:
-            top = min(int(y + ah * bfrac), ih - 1)
-            bot = min(int(top + ah * hfrac), ih)
-            if bot <= top:
-                continue
-            crop = img[top:bot, x:iw]
-            if crop.size == 0:
-                continue
-
-            plate, conf = _ocr_crop(crop)
-            if plate and conf > best_conf:
-                if _validate_plate_sequence(crop, plate, reader):
-                    best_plate, best_conf = plate, conf
-                    best_bbox = {"x": max(0, int(x + vw * 0.05)),
-                                 "y": top,
-                                 "width": min(int(vw * 0.95), iw - x - 1),
-                                 "height": max(int(ah * 0.18), 10)}
-
-        # Full vehicle crop
-        crop2 = img[y:y2, x:x2]
-        if crop2.size > 0:
-            plate2, conf2 = _ocr_crop(crop2)
-            if plate2 and conf2 > best_conf:
-                if _validate_plate_sequence(crop2, plate2, reader):
-                    best_plate, best_conf = plate2, conf2
-                    best_bbox = {"x": x, "y": y, "width": aw, "height": ah}
-
-        if best_plate and best_conf > 0 and best_bbox:
+        if plate_text and plate_text != "unknown":
             results.append({
-                "plateNumber": best_plate,
-                "confidence": round(min(best_conf, 0.95), 3),
-                "bbox": best_bbox,
+                "plateNumber": plate_text.upper().strip(),
+                "confidence": round(min(conf, 0.99), 3),
+                "bbox": {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1},
             })
 
     return results

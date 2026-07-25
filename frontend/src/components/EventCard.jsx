@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom';
 import { uploadsUrl } from '../api';
-import { User, Car, CreditCard, Clock } from 'lucide-react';
+import { User, Car, CreditCard, Clock, ShieldAlert, UserCheck } from 'lucide-react';
 import { format } from 'date-fns';
 
 export default function EventCard({ event }) {
@@ -21,6 +21,17 @@ export default function EventCard({ event }) {
           <Clock size={14} /> {date}
         </div>
         <div className="event-card-tags">
+          {/* Identity first — it is the most important thing about the event. */}
+          {analysis?.faces?.some((f) => f.isStranger) && (
+            <span className="tag tag-alert">
+              <ShieldAlert size={12} /> Người lạ
+            </span>
+          )}
+          {analysis?.faces?.some((f) => f.name) && (
+            <span className="tag tag-ok">
+              <UserCheck size={12} /> {analysis.faces.filter((f) => f.name).map((f) => f.name).join(', ')}
+            </span>
+          )}
           {analysis?.persons?.length > 0 && (
             <span className="tag tag-person"><User size={12} /> {analysis.persons.length}</span>
           )}

@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Maximize2, Camera } from 'lucide-react';
+import { Camera } from 'lucide-react';
 import { format } from 'date-fns';
 import { api, uploadsUrl } from '../api';
 import { useToast } from '../components/Toast';
@@ -29,9 +29,6 @@ function CamFeed({ cam, isWatching, hlsUrl, onFullscreen, onCapture }) {
       onKeyDown={(e) => { if (e.key === 'Enter') onFullscreen(cam); }}
     >
       <div className="cam-feed-actions">
-        <button className="cam-feed-btn" onClick={(e) => { e.stopPropagation(); onFullscreen(cam); }} aria-label="Phóng to">
-          <Maximize2 size={12} />
-        </button>
         {canCapture && (
           <button className="cam-feed-btn" onClick={(e) => { e.stopPropagation(); onCapture(cam); }} aria-label="Chụp ảnh">
             <Camera size={12} />
@@ -46,7 +43,12 @@ function CamFeed({ cam, isWatching, hlsUrl, onFullscreen, onCapture }) {
             onError={(e) => { e.target.style.display = 'none'; }}
           />
         ) : hasHls ? (
-          <HlsPlayer src={hlsUrl} style={{ width: '100%', height: '100%' }} />
+          <HlsPlayer
+            src={hlsUrl}
+            detectOverlay
+            detectDefault={false}
+            style={{ width: '100%', height: '100%' }}
+          />
         ) : !isOnline ? (
           <div className="cam-offline-content">
             <div className="cam-offline-icon">&#9655;</div>
@@ -73,6 +75,9 @@ function CamFeed({ cam, isWatching, hlsUrl, onFullscreen, onCapture }) {
 
 function getTagClass(tags) {
   if (!tags) return 'tag-person';
+  // Identity outranks everything else in the recent-events list.
+  if (tags.includes('stranger')) return 'tag-alert';
+  if (tags.includes('known-person')) return 'tag-ok';
   if (tags.includes('person')) return 'tag-person';
   if (tags.includes('plate') || tags.includes('license-plate')) return 'tag-plate';
   if (tags.includes('vehicle')) return 'tag-person';
@@ -81,6 +86,8 @@ function getTagClass(tags) {
 
 function getTagLabel(tags) {
   if (!tags || tags.length === 0) return 'Sự kiện';
+  if (tags.includes('stranger')) return 'Người lạ';
+  if (tags.includes('known-person')) return 'Người quen';
   if (tags.includes('person')) return 'Người';
   if (tags.includes('plate') || tags.includes('license-plate')) return 'Biển số';
   if (tags.includes('vehicle')) return 'Phương tiện';
@@ -90,6 +97,10 @@ function getTagLabel(tags) {
 function getEventDescription(event) {
   const { analysis } = event;
   const camName = event.cameraId?.name || 'Camera';
+  const strangers = (analysis?.faces || []).filter((f) => f.isStranger).length;
+  if (strangers > 0) return `${strangers} người lạ tại ${camName}`;
+  const names = (analysis?.faces || []).filter((f) => f.name).map((f) => f.name);
+  if (names.length > 0) return `${names.join(', ')} tại ${camName}`;
   if (analysis?.licensePlates?.length > 0) return analysis.licensePlates[0].plateNumber;
   if (analysis?.persons?.length > 0) return `Phát hiện ${analysis.persons.length} người tại ${camName}`;
   if (analysis?.vehicles?.length > 0) return `${analysis.vehicles.length} phương tiện tại ${camName}`;
@@ -294,6 +305,9 @@ export default function Dashboard() {
         {fullscreenCam && hlsStreams[fullscreenCam._id] ? (
           <HlsPlayer
             src={hlsStreams[fullscreenCam._id]}
+            detectOverlay
+            recordable
+            recordLabel={fullscreenCam.name?.replace(/[^\w-]+/g, '_') || 'camera'}
             style={{ width: '100%', maxHeight: '80vh' }}
           />
         ) : fullscreenCam && fullscreenCam.ipAddress && fullscreenCam.status === 'online' && isIpWebcamCamera(fullscreenCam) ? (

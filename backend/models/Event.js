@@ -24,10 +24,20 @@ const licensePlateSchema = new mongoose.Schema({
   bbox: bboxSchema,
 }, { _id: false });
 
+// Identity-annotated face (embeddings are NOT stored on events — only the match result).
+const faceSchema = new mongoose.Schema({
+  bbox: bboxSchema,
+  score: Number,
+  name: { type: String, default: '' },
+  similarity: { type: Number, default: 0 },
+  isStranger: { type: Boolean, default: false },
+}, { _id: false });
+
 const analysisSchema = new mongoose.Schema({
   persons: [personSchema],
   vehicles: [vehicleSchema],
   licensePlates: [licensePlateSchema],
+  faces: [faceSchema],
 }, { _id: false });
 
 const eventSchema = new mongoose.Schema({

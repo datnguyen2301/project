@@ -87,37 +87,52 @@ def _pic_from_alarm(alarm):
     return alarm.get("picUrl") or alarm.get("alarmPicUrl")
 
 
+def _alarm_time_ms(alarm):
+    """Best-effort alarm capture time as epoch ms; None if unparseable."""
+    for k in ("alarmStartTime", "alarmTime", "startTime", "createTime", "sysTime"):
+        v = alarm.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v if v > 1e12 else v * 1000)
+        if isinstance(v, str) and v.isdigit():
+            n = int(v)
+            return n if n > 1e12 else n * 1000
+    import datetime
+    for k in ("alarmStartTimeStr", "alarmTimeStr", "startTimeStr"):
+        s = alarm.get(k)
+        if s:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    return int(datetime.datetime.strptime(str(s)[:19], fmt).timestamp() * 1000)
+                except Exception:
+                    pass
+    return None
+
+
 def _get_alarm_url(client, serial, fast=False):
-    # Check cache first
+    # Check cache first (stores both url and its capture time)
     cached = _alarm_cache.get(serial)
     if cached and (time.time() - cached["ts"]) < _alarm_cache_ttl:
-        return cached["url"]
+        return cached["url"], cached.get("time")
 
-    if fast:
-        data = client.get_alarminfo(serial, limit=5)
+    limits = (5,) if fast else (40, 15, 5)
+    for limit in limits:
+        data = client.get_alarminfo(serial, limit=limit)
         alarms = data.get("alarms") or []
         for alarm in alarms:
             pic = _pic_from_alarm(alarm)
             if _is_real_pic_url(pic):
-                _alarm_cache[serial] = {"url": pic, "ts": time.time()}
-                return pic
-    else:
-        for limit in (40, 15, 5):
-            data = client.get_alarminfo(serial, limit=limit)
-            alarms = data.get("alarms") or []
-            for alarm in alarms:
-                pic = _pic_from_alarm(alarm)
-                if _is_real_pic_url(pic):
-                    _alarm_cache[serial] = {"url": pic, "ts": time.time()}
-                    return pic
+                t = _alarm_time_ms(alarm)
+                _alarm_cache[serial] = {"url": pic, "time": t, "ts": time.time()}
+                return pic, t
 
-        # Fallback: camera status last alarm pic
+    if not fast:
+        # Fallback: camera status last alarm pic (no reliable time → None)
         cam = EzvizCamera(client, serial)
         st = cam.status()
         pic = st.get("last_alarm_pic") or ""
         if _is_real_pic_url(pic):
-            _alarm_cache[serial] = {"url": pic, "ts": time.time()}
-            return pic
+            _alarm_cache[serial] = {"url": pic, "time": None, "ts": time.time()}
+            return pic, None
 
     raise ValueError(
         f"No valid alarm image found for {serial}"
@@ -191,8 +206,8 @@ def handle_capture(client, args):
     serial = args.get("serial", "")
     if not serial:
         raise ValueError("serial required")
-    url = _get_alarm_url(client, serial, fast=args.get("fast", True))
-    return {"serial": serial, "picUrl": url}
+    url, pic_time = _get_alarm_url(client, serial, fast=args.get("fast", True))
+    return {"serial": serial, "picUrl": url, "picTime": pic_time}
 
 
 def handle_rtsp_info(client, args):
