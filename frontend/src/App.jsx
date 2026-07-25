@@ -12,6 +12,7 @@ const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Events = lazy(() => import('./pages/Events'));
 const EventDetail = lazy(() => import('./pages/EventDetail'));
 const Cameras = lazy(() => import('./pages/Cameras'));
+const PlaybackPage = lazy(() => import('./pages/PlaybackPage'));
 const UploadPage = lazy(() => import('./pages/UploadPage'));
 const SearchPage = lazy(() => import('./pages/SearchPage'));
 const PlatesPage = lazy(() => import('./pages/PlatesPage'));
@@ -57,6 +58,7 @@ export default function App() {
                 <Route path="events" element={<Events />} />
                 <Route path="events/:id" element={<EventDetail />} />
                 <Route path="cameras" element={<Cameras />} />
+                <Route path="playback" element={<PlaybackPage />} />
                 <Route path="upload" element={<UploadPage />} />
                 <Route path="search" element={<SearchPage />} />
                 <Route path="plates" element={<PlatesPage />} />

@@ -26,6 +26,10 @@ process.on('unhandledRejection', (reason, promise) => {
 // the reload stalls.
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGUSR2']) {
   process.once(sig, () => {
+    // Recorders first: stop() writes 'q' so ffmpeg finalises the in-progress
+    // segment (writes its moov). Tearing the EZVIZ helper down first would kill
+    // the source out from under it and leave that segment unplayable.
+    try { require('./services/continuousRecorder').stopAll(); } catch (_) {}
     try { require('./services/ezvizCloudStream').stopAll(); } catch (_) {}
     if (sig === 'SIGUSR2') {
       process.kill(process.pid, sig);
@@ -44,6 +48,7 @@ const authMiddleware = require('./middleware/auth');
 const authRouter = require('./routes/auth');
 const blacklistRouter = require('./routes/blacklist');
 const streamRouter = require('./routes/stream');
+const playbackRouter = require('./routes/playback');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -100,6 +105,7 @@ app.use('/api/ipcam', authMiddleware, ipcamRouter);
 app.use('/api/watcher', authMiddleware, watcherRouter);
 app.use('/api/blacklist', authMiddleware, blacklistRouter);
 app.use('/api/stream', authMiddleware, streamRouter);
+app.use('/api/playback', authMiddleware, playbackRouter);
 
 // ── Express global error handler — catches all unhandled route errors ──
 app.use((err, _req, res, _next) => {
@@ -112,6 +118,7 @@ const { restoreWatchers } = require('./services/watcher');
 const { checkFfmpeg } = require('./services/stream');
 const { addClient, removeClient } = require('./services/sse');
 const { startCleanupScheduler } = require('./services/cleanup');
+const { restoreRecorders } = require('./services/continuousRecorder');
 
 connectDB().then(() => {
   app.listen(PORT, () => {
@@ -125,5 +132,8 @@ connectDB().then(() => {
     }
     checkFfmpeg();
     startCleanupScheduler();
+    // Defaults to true, unlike RESTORE_AUTOWATCH_ON_START: resuming continuous
+    // recording after a restart is the whole point of persisting autoRecord.
+    restoreRecorders();
   });
 });

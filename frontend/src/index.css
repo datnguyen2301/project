@@ -1601,3 +1601,90 @@ tr:hover td { background: var(--color-background-hover); }
 .clip-detail {
   padding-bottom: 20px;
 }
+
+/* ─── Playback (Xem lại) ─── */
+/* Prefixed .pb- because .timeline-* is already the vertical event list. */
+.pb-video { position: relative; border-radius: var(--border-radius-md); overflow: hidden; background: #000; }
+.pb-clock {
+  position: absolute; top: 8px; left: 10px; z-index: 2;
+  padding: 2px 8px; border-radius: 4px;
+  background: rgba(0,0,0,0.65); color: #fff;
+  font-family: var(--font-label); font-size: 12px; letter-spacing: 0.04em;
+  pointer-events: none;
+}
+.pb-timeline { margin-top: 12px; user-select: none; }
+.pb-timeline-track {
+  position: relative; height: 34px; cursor: pointer;
+  background: var(--color-background-secondary);
+  border: 1px solid var(--color-border-primary, #2a3446);
+  border-radius: var(--border-radius-sm);
+  overflow: hidden;
+}
+.pb-timeline-track:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+/* Recorded spans. Gaps are simply the unpainted track showing through. */
+.pb-run {
+  position: absolute; top: 0; bottom: 0;
+  background: var(--blue-muted, #1e3a5f);
+  border-left: 1px solid var(--blue, #2563eb);
+  /* A few minutes of footage is ~0.1% of a 24h bar, i.e. sub-pixel. Without a
+     floor the recorded span is invisible and the timeline looks empty. */
+  min-width: 3px;
+}
+.pb-marker { position: absolute; top: 0; bottom: 0; width: 3px; margin-left: -1px; cursor: pointer; }
+.pb-marker:hover { width: 5px; margin-left: -2px; }
+.pb-marker-person  { background: var(--green, #16a34a); }
+.pb-marker-vehicle { background: var(--blue, #2563eb); }
+.pb-marker-plate   { background: var(--amber, #d97706); }
+.pb-playhead { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--red, #dc2626); box-shadow: 0 0 4px rgba(220,38,38,0.8); pointer-events: none; }
+.pb-hours { position: relative; height: 16px; margin-top: 2px; }
+.pb-hour-tick {
+  position: absolute; transform: translateX(-50%);
+  font-family: var(--font-label); font-size: 10px;
+  color: var(--color-text-muted, #64748b);
+}
+.pb-meta {
+  display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px;
+  font-family: var(--font-label); font-size: 12px;
+  color: var(--color-text-secondary, #94a3b8);
+}
+@media (max-width: 900px) {
+  .pb-timeline-track { height: 44px; }  /* easier touch target */
+  .pb-meta { gap: 10px; font-size: 11px; }
+}
+
+/* Playback: player + browsable segment list side by side */
+.pb-layout { display: grid; grid-template-columns: 1fr 260px; gap: 16px; align-items: start; }
+.pb-main { min-width: 0; }   /* lets the video shrink instead of overflowing the grid */
+.pb-side {
+  border: 1px solid var(--color-border-primary, #2a3446);
+  border-radius: var(--border-radius-md);
+  overflow: hidden;
+  background: var(--color-background-secondary);
+}
+.pb-side-head {
+  padding: 8px 12px;
+  font-family: var(--font-label); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--color-text-secondary, #94a3b8);
+  border-bottom: 1px solid var(--color-border-primary, #2a3446);
+}
+.pb-side-list { max-height: 58vh; overflow-y: auto; }
+.pb-seg-item {
+  display: flex; flex-direction: column; gap: 2px;
+  width: 100%; padding: 8px 12px; text-align: left;
+  background: none; border: none; cursor: pointer;
+  border-bottom: 1px solid var(--color-border-secondary, #1c2532);
+  color: var(--color-text-primary, #e2e8f0);
+}
+.pb-seg-item:hover { background: var(--color-background-hover, #172033); }
+.pb-seg-item.active {
+  background: var(--blue-muted, #1e3a5f);
+  box-shadow: inset 3px 0 0 var(--blue, #2563eb);
+}
+.pb-seg-time { font-family: var(--font-label); font-size: 13px; font-weight: 600; }
+.pb-seg-meta { font-size: 11px; color: var(--color-text-secondary, #94a3b8); }
+.pb-seg-ev { color: var(--green, #16a34a); }
+@media (max-width: 900px) {
+  .pb-layout { grid-template-columns: 1fr; }   /* list drops below the player */
+  .pb-side-list { max-height: 240px; }
+}

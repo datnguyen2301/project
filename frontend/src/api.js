@@ -130,6 +130,21 @@ export const api = {
     request(`/stream/stop/${cameraId}`, { method: 'POST' }),
   streamStatus: () => request('/stream/status'),
 
+  // Playback (continuous recording timeline). Note getRecordingStatus() above is
+  // a different thing — that one reports in-progress motion clips.
+  playbackCameras: () => request('/playback/cameras'),
+  playbackDays: (cameraId) => request(`/playback/days/${cameraId}`),
+  playbackTimeline: (cameraId, date) =>
+    request(`/playback/timeline/${cameraId}?date=${encodeURIComponent(date)}`),
+  playbackSeek: (cameraId, at) =>
+    request(`/playback/seek/${cameraId}?at=${encodeURIComponent(at)}`),
+  playbackSetRecording: (cameraId, enabled) =>
+    request(`/playback/record/${cameraId}`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
+  playbackRecorderStatus: () => request('/playback/record/status'),
+
   login: (username, password) =>
     request('/auth/login', {
       method: 'POST',

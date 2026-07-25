@@ -1,6 +1,7 @@
 const express = require('express');
 const Camera = require('../models/Camera');
 const watcher = require('../services/watcher');
+const recorder = require('../services/continuousRecorder');
 
 const router = express.Router();
 
@@ -32,6 +33,14 @@ router.put('/:id', async (req, res) => {
     if (camera.autoWatch === false) {
       await watcher.stopWatch(req.params.id);
     }
+    // Keep the persisted autoRecord flag and the running recorder in step, the
+    // same way autoWatch drives the watcher above.
+    if (camera.autoRecord && !recorder.isRecording(req.params.id)) {
+      recorder.start(req.params.id).catch((e) =>
+        console.warn(`[recorder] start on update failed: ${e.message}`));
+    } else if (!camera.autoRecord && recorder.isRecording(req.params.id)) {
+      recorder.stop(req.params.id);
+    }
     res.json(camera);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -41,6 +50,7 @@ router.put('/:id', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   try {
     await watcher.stopWatch(req.params.id);
+    recorder.stop(req.params.id);
     const camera = await Camera.findByIdAndDelete(req.params.id);
     if (!camera) return res.status(404).json({ error: 'Camera not found' });
     res.json({ message: 'Camera deleted' });

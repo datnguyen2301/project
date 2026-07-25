@@ -5,6 +5,7 @@ import { vi } from 'date-fns/locale';
 import {
   LayoutDashboard,
   Clock,
+  History,
   Search,
   RectangleHorizontal,
   UserRound,
@@ -21,6 +22,7 @@ import { useToast } from './Toast';
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Camera trực tiếp' },
   { to: '/events', icon: Clock, label: 'Sự kiện' },
+  { to: '/playback', icon: History, label: 'Xem lại' },
   { to: '/search', icon: Search, label: 'Tra cứu' },
   { to: '/plates', icon: RectangleHorizontal, label: 'Biển số xe' },
 ];

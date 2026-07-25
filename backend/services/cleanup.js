@@ -1,15 +1,26 @@
 const fs = require('fs');
 const path = require('path');
 const Event = require('../models/Event');
+const Recording = require('../models/Recording');
 
 const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
 const CLIPS_DIR = path.join(UPLOADS_DIR, 'clips');
 const CACHE_DIR = path.join(UPLOADS_DIR, '.watcher_cache');
+const RECORDINGS_DIR = path.join(UPLOADS_DIR, 'recordings');
 
 const CLIP_RETENTION_DAYS = parseInt(process.env.CLIP_RETENTION_DAYS || '30', 10);
 const CLIP_RETENTION_MS = CLIP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
+// Continuous recordings are far bulkier than clips (~6.5 GB/day/camera at
+// 480p/600k) so they get their own, shorter retention plus a hard free-space
+// floor. The floor is what actually caps usage: 14 days x 2 cameras exceeds the
+// disk, so the oldest segments are evicted before the age limit is reached.
+const RECORD_RETENTION_DAYS = parseInt(process.env.RECORD_RETENTION_DAYS || '14', 10);
+const RECORD_MIN_FREE_GB = parseFloat(process.env.RECORD_MIN_FREE_GB || '15');
+const RECORD_SWEEP_MIN = parseInt(process.env.RECORD_SWEEP_INTERVAL_MIN || '15', 10);
+
 let cleanupTimer = null;
+let recordingSweepTimer = null;
 
 async function deleteFile(filePath) {
   try {
@@ -144,11 +155,101 @@ async function cleanUpTempFiles() {
   }
 }
 
+// ── Continuous recordings ─────────────────────────────────────────────────────
+
+/** Delete one indexed segment: file first, then its row. */
+async function dropRecording(rec) {
+  if (rec.filePath) await deleteFile(path.join(UPLOADS_DIR, rec.filePath));
+  await Recording.deleteOne({ _id: rec._id });
+}
+
+/** Age-based retention for continuous recordings. */
+async function cleanUpOldRecordings() {
+  const cutoff = new Date(Date.now() - RECORD_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  try {
+    const old = await Recording.find({ startedAt: { $lt: cutoff } })
+      .select('filePath _id')
+      .lean();
+    for (const rec of old) await dropRecording(rec);
+    if (old.length) {
+      console.log(`[cleanup] Removed ${old.length} recording segment(s) older than ${RECORD_RETENTION_DAYS}d`);
+    }
+    await pruneEmptyRunDirs();
+    return { deletedRecordings: old.length };
+  } catch (err) {
+    console.warn('[cleanup] Recording retention error:', err.message);
+    return { error: err.message };
+  }
+}
+
+/** Free bytes on the volume holding uploads/, or null if unavailable. */
+async function freeBytes() {
+  try {
+    const st = await fs.promises.statfs(UPLOADS_DIR);
+    return st.bavail * st.bsize;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Evict oldest-first until the free-space floor is satisfied. This runs on its
+ * own short timer rather than the 24h cleanup cycle: at ~13 GB/day a daily sweep
+ * would let the disk fill long before it fired.
+ */
+async function enforceDiskFloor() {
+  const floor = RECORD_MIN_FREE_GB * 1024 ** 3;
+  let free = await freeBytes();
+  if (free === null) return { skipped: 'statfs unavailable' };
+  if (free >= floor) return { evicted: 0, freeGb: +(free / 1024 ** 3).toFixed(1) };
+
+  let evicted = 0;
+  // Oldest first, in batches, re-checking free space as we go.
+  while (free !== null && free < floor) {
+    const batch = await Recording.find({}).sort({ startedAt: 1 }).limit(20).select('filePath _id sizeBytes').lean();
+    if (!batch.length) break;
+    for (const rec of batch) {
+      await dropRecording(rec);
+      evicted += 1;
+    }
+    free = await freeBytes();
+  }
+  if (evicted) {
+    console.warn(`[cleanup] Disk floor (${RECORD_MIN_FREE_GB}GB): evicted ${evicted} oldest segment(s), free now ${(free / 1024 ** 3).toFixed(1)}GB`);
+  }
+  await pruneEmptyRunDirs();
+  return { evicted, freeGb: free === null ? null : +(free / 1024 ** 3).toFixed(1) };
+}
+
+/** Remove run directories left empty after their segments were deleted. */
+async function pruneEmptyRunDirs() {
+  try {
+    const cams = await fs.promises.readdir(RECORDINGS_DIR, { withFileTypes: true }).catch(() => []);
+    for (const cam of cams) {
+      if (!cam.isDirectory()) continue;
+      const camDir = path.join(RECORDINGS_DIR, cam.name);
+      const runs = await fs.promises.readdir(camDir, { withFileTypes: true }).catch(() => []);
+      for (const run of runs) {
+        if (!run.isDirectory()) continue;
+        const runDir = path.join(camDir, run.name);
+        const files = await fs.promises.readdir(runDir).catch(() => []);
+        // Only the segment list left => the run is fully reaped.
+        if (files.length === 0 || (files.length === 1 && files[0] === 'segments.csv')) {
+          for (const f of files) await deleteFile(path.join(runDir, f));
+          try { await fs.promises.rmdir(runDir); } catch (_) {}
+        }
+      }
+    }
+  } catch (_) { /* best effort */ }
+}
+
 async function runCleanup() {
   const result = {};
   result.clipCleanup = await cleanUpOldClips();
   result.orphanCleanup = await cleanUpOrphanedClips();
   result.tempCleanup = await cleanUpTempFiles();
+  result.recordingCleanup = await cleanUpOldRecordings();
+  result.diskFloor = await enforceDiskFloor();
   return result;
 }
 
@@ -165,6 +266,17 @@ function startCleanupScheduler() {
 
   console.log(`[cleanup] Scheduler started (interval: ${intervalHours}h)`);
 
+  // Continuous recording fills disk far faster than the 24h cycle can react, so
+  // the free-space floor gets its own short-interval sweep.
+  if (recordingSweepTimer) clearInterval(recordingSweepTimer);
+  recordingSweepTimer = setInterval(async () => {
+    try {
+      const r = await enforceDiskFloor();
+      if (r.evicted) console.log('[cleanup] Recording sweep:', JSON.stringify(r));
+    } catch (_) {}
+  }, RECORD_SWEEP_MIN * 60 * 1000);
+  console.log(`[cleanup] Recording disk-floor sweep every ${RECORD_SWEEP_MIN}m (floor ${RECORD_MIN_FREE_GB}GB)`);
+
   runCleanup().then((result) => {
     console.log('[cleanup] Initial cleanup done:', JSON.stringify(result));
   }).catch(() => {});
@@ -176,6 +288,10 @@ function stopCleanupScheduler() {
     cleanupTimer = null;
     console.log('[cleanup] Scheduler stopped');
   }
+  if (recordingSweepTimer) {
+    clearInterval(recordingSweepTimer);
+    recordingSweepTimer = null;
+  }
 }
 
 module.exports = {
@@ -185,5 +301,8 @@ module.exports = {
   cleanUpOldClips,
   cleanUpOrphanedClips,
   cleanUpTempFiles,
+  cleanUpOldRecordings,
+  enforceDiskFloor,
   CLIP_RETENTION_DAYS,
+  RECORD_RETENTION_DAYS,
 };

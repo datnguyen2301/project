@@ -452,4 +452,7 @@ module.exports = {
   checkFfmpeg,
   checkFfprobe,
   buildRtspUrlCandidates: buildCandidates,
+  // Exported for continuousRecorder, which must reject a stale rtspHost the same
+  // way startStream does rather than carrying its own copy of the probe.
+  checkTcpReachable,
 };
